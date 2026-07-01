@@ -1,0 +1,409 @@
+// Thin wrapper around grammY's Api client. We don't use the full Bot class
+// because grammY's middleware model assumes a long-lived process — Convex
+// actions are ephemeral and we want each invocation to have access to its own
+// `ctx`. The Api class is stateless and uses native fetch, so it bundles into
+// Convex's v8 runtime without trouble.
+
+import { Api } from "grammy";
+
+let cached: Api | null = null;
+function api(): Api {
+  if (cached) return cached;
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set in Convex env");
+  cached = new Api(token);
+  return cached;
+}
+
+type ParseMode = "Markdown" | "MarkdownV2" | "HTML";
+
+async function rawTelegramMethod<T>(
+  method: string,
+  body: Record<string, unknown>,
+): Promise<T> {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set in Convex env");
+
+  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const json = (await res.json()) as {
+    ok?: boolean;
+    result?: T;
+    description?: string;
+    error_code?: number;
+  };
+  if (!res.ok || !json.ok) {
+    throw new Error(
+      `Telegram ${method} failed (${json.error_code ?? res.status}): ${json.description ?? res.statusText}`,
+    );
+  }
+  return json.result as T;
+}
+
+// Inline-keyboard rows. Each entry is either a callback button (data is
+// returned in callback_query.data) or a URL button (Telegram opens it
+// directly — useful for deep-linking back into the bot's DM).
+export type InlineButton =
+  | { text: string; callback_data: string }
+  | { text: string; url: string };
+export type InlineKeyboard = InlineButton[][];
+
+interface SendOpts {
+  replyToMessageId?: number;
+  parseMode?: ParseMode;
+  inlineKeyboard?: InlineKeyboard;
+}
+
+function buildReplyMarkup(keyboard: InlineKeyboard | undefined) {
+  if (!keyboard) return undefined;
+  return { inline_keyboard: keyboard };
+}
+
+export async function sendMessage(
+  chatId: number,
+  text: string,
+  opts: SendOpts = {},
+): Promise<{ message_id: number }> {
+  return await api().sendMessage(chatId, text, {
+    link_preview_options: { is_disabled: true },
+    ...(opts.replyToMessageId !== undefined
+      ? {
+          reply_parameters: {
+            message_id: opts.replyToMessageId,
+            allow_sending_without_reply: true,
+          },
+        }
+      : {}),
+    ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+    ...(opts.inlineKeyboard
+      ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+      : {}),
+  });
+}
+
+// Edits an existing bot message in place. Used to:
+//   1. Replace the "Обрабатываю…" placeholder with progress hints.
+//   2. Commit the final HTML message + inline keyboard.
+export async function editMessageText(
+  chatId: number,
+  messageId: number,
+  text: string,
+  opts: { parseMode?: ParseMode; inlineKeyboard?: InlineKeyboard } = {},
+): Promise<void> {
+  try {
+    await api().editMessageText(chatId, messageId, text, {
+      link_preview_options: { is_disabled: true },
+      ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+  } catch (err) {
+    // Ignore "message is not modified" — Telegram returns 400 if the new
+    // text is identical to the existing one. Anything else propagates.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/message is not modified/i.test(msg)) throw err;
+  }
+}
+
+// Edits only the inline keyboard of a bot message — useful for sub-picker
+// navigation where the text stays the same but the buttons change.
+export async function editMessageReplyMarkup(
+  chatId: number,
+  messageId: number,
+  inlineKeyboard: InlineKeyboard | undefined,
+): Promise<void> {
+  try {
+    await api().editMessageReplyMarkup(chatId, messageId, {
+      ...(inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(inlineKeyboard)! }
+        : {}),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/message is not modified/i.test(msg)) throw err;
+  }
+}
+
+// Deletes a bot message. Tolerant of "message to delete not found" / "not
+// modified" errors so callers can call it idempotently.
+export async function deleteMessage(
+  chatId: number,
+  messageId: number,
+): Promise<void> {
+  try {
+    await api().deleteMessage(chatId, messageId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      !/message to delete not found|message can't be deleted|not found/i.test(
+        msg,
+      )
+    ) {
+      console.warn("deleteMessage failed", msg);
+    }
+  }
+}
+
+// Acknowledges a callback_query. Required within ~10s of receiving one,
+// otherwise the loading spinner on the user's button stays forever.
+export async function answerCallbackQuery(
+  callbackQueryId: string,
+  text?: string,
+  showAlert = false,
+): Promise<void> {
+  try {
+    await api().answerCallbackQuery(callbackQueryId, {
+      ...(text ? { text } : {}),
+      show_alert: showAlert,
+    });
+  } catch (err) {
+    // Old / already-answered callback queries throw — not actionable.
+    console.warn(
+      "answerCallbackQuery failed",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+// Bot API 10.0 guest mode. grammY may lag behind the newest Bot API types, so
+// this uses the raw HTTP endpoint directly.
+export async function answerGuestQuery(
+  guestQueryId: string,
+  result: Record<string, unknown>,
+): Promise<{ message_id?: number; inline_message_id?: string }> {
+  return await rawTelegramMethod("answerGuestQuery", {
+    guest_query_id: guestQueryId,
+    result,
+  });
+}
+
+export async function editGuestMessageText(
+  inlineMessageId: string,
+  text: string,
+  opts: { parseMode?: ParseMode; inlineKeyboard?: InlineKeyboard } = {},
+): Promise<void> {
+  try {
+    await rawTelegramMethod("editMessageText", {
+      inline_message_id: inlineMessageId,
+      text,
+      link_preview_options: { is_disabled: true },
+      ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/message is not modified/i.test(msg)) throw err;
+  }
+}
+
+// Looks up our own bot username via getMe so we can build deep-link URLs
+// like t.me/<username>?start=… for group reply buttons.
+export async function getMe(): Promise<{
+  id: number;
+  username: string | undefined;
+  first_name: string;
+}> {
+  const me = await api().getMe();
+  return { id: me.id, username: me.username, first_name: me.first_name };
+}
+
+// Telegram's hard text limit per message is 4096 chars; we leave some
+// headroom for HTML wrappers (e.g. <blockquote expandable>…</blockquote>).
+export const TG_TEXT_LIMIT = 4000;
+
+// Splits text into chunks that fit Telegram's limit. Tries to break on
+// double newlines (paragraph), then single newlines, then spaces, and only
+// hard-cuts as a last resort. Doesn't try to keep HTML tags balanced —
+// callers should split content where tags are unlikely to span (line
+// boundaries are usually fine).
+export function splitTextSafely(
+  text: string,
+  maxLen: number = TG_TEXT_LIMIT,
+): string[] {
+  if (text.length <= maxLen) return [text];
+  const chunks: string[] = [];
+  let rest = text;
+  while (rest.length > maxLen) {
+    let cut = rest.lastIndexOf("\n\n", maxLen);
+    if (cut < maxLen / 2) cut = rest.lastIndexOf("\n", maxLen);
+    if (cut < maxLen / 2) cut = rest.lastIndexOf(" ", maxLen);
+    if (cut <= 0) cut = maxLen; // no good boundary; hard-cut
+    chunks.push(rest.slice(0, cut).trimEnd());
+    rest = rest.slice(cut).trimStart();
+  }
+  if (rest.length > 0) chunks.push(rest);
+  return chunks;
+}
+
+// Custom emoji used as a loading spinner in status messages. Rendered via
+// Telegram's <tg-emoji> HTML tag (Bot API 5.6+, available to any bot that
+// is allowed to use premium/custom emoji). Non-premium users fall back to
+// the inner plain-unicode character.
+// https://core.telegram.org/bots/api#html-style
+export const LOADING_CUSTOM_EMOJI_ID = "5325792861885570739";
+export function loadingEmoji(fallback = "⏳"): string {
+  return `<tg-emoji emoji-id="${LOADING_CUSTOM_EMOJI_ID}">${fallback}</tg-emoji>`;
+}
+
+// Replaces `msg:MESSAGE_ID` hrefs (emitted by markdownToTelegramHtml from
+// the LLM's `[text](msg:12345)` links) with real Telegram deep-links. For
+// private supergroups the format is `https://t.me/c/CHANNEL_ID/MSG_ID`
+// where CHANNEL_ID is the numeric chat id with the `-100` prefix stripped.
+export function resolveMessageLinks(html: string, chatId: number): string {
+  const channelId = String(chatId).replace(/^-100/, "");
+  return html.replace(
+    /href="msg:(\d+)"/g,
+    (_match, msgId: string) => `href="https://t.me/c/${channelId}/${msgId}"`,
+  );
+}
+
+// HTML escape for the Telegram HTML parse mode. Telegram's HTML mode only
+// recognizes a tiny set of tags, so escaping <, >, & is sufficient and we
+// don't have to worry about ", '.
+// https://core.telegram.org/bots/api#html-style
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Convert GitHub-flavored markdown (what LLMs naturally emit) into the
+// limited HTML subset that Telegram understands. The pipeline:
+//   1. Stash code blocks and inline code so later regexes can't mangle them.
+//   2. HTML-escape what's left.
+//   3. Re-apply formatting via regex (bold, italic, links, headings…).
+//   4. Restore the stashed code.
+//
+// We deliberately don't try to render lists — Telegram HTML has no list
+// tags, so `- foo` and `1. bar` are left as plain text, which renders fine.
+//
+// Telegram HTML reference: https://core.telegram.org/bots/api#html-style
+export function markdownToTelegramHtml(text: string): string {
+  const slots: string[] = [];
+  const stash = (html: string): string => {
+    const idx = slots.push(html) - 1;
+    return `\u0000SLOT${idx}\u0000`;
+  };
+
+  // 1a. Triple-backtick code blocks. ``` lang\ncode\n``` and plain ```code```.
+  let s = text.replace(
+    /```(\w*)\n?([\s\S]*?)```/g,
+    (_m, lang: string, code: string) => {
+      const inner = escapeHtml(code.replace(/\n$/, ""));
+      return stash(
+        lang
+          ? `<pre><code class="language-${escapeHtml(lang)}">${inner}</code></pre>`
+          : `<pre>${inner}</pre>`,
+      );
+    },
+  );
+
+  // 1b. Inline code: `code`.
+  s = s.replace(/`([^`\n]+)`/g, (_m, code: string) =>
+    stash(`<code>${escapeHtml(code)}</code>`),
+  );
+
+  // 2. Escape any remaining HTML special chars in the non-code text.
+  s = escapeHtml(s);
+
+  // 3a. Bold: **text** and __text__.
+  s = s.replace(/\*\*([^*\n]+?)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(?<!\w)__([^_\n]+?)__(?!\w)/g, "<b>$1</b>");
+
+  // 3b. Italic: *text* and _text_ — single tokens only, must not be inside
+  // a word so we don't break `snake_case` identifiers in plain prose.
+  s = s.replace(/(?<![*\w])\*([^*\n]+?)\*(?![*\w])/g, "<i>$1</i>");
+  s = s.replace(/(?<![_\w])_([^_\n]+?)_(?![_\w])/g, "<i>$1</i>");
+
+  // 3c. Strikethrough: ~~text~~.
+  s = s.replace(/~~([^~\n]+?)~~/g, "<s>$1</s>");
+
+  // 3d. Links: [text](url). Telegram supports plain http/https hrefs.
+  s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
+
+  // 3e. Headings: # … ###### become bold.
+  s = s.replace(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/gm, "<b>$1</b>");
+
+  // 4. Restore stashed code spans.
+  s = s.replace(
+    /\u0000SLOT(\d+)\u0000/g,
+    (_m, idx: string) => slots[Number(idx)],
+  );
+
+  return s;
+}
+
+// Telegram caps text messages at 4096 chars. Split on a safe boundary so we
+// don't get a 400 from the API on long summaries.
+export async function sendLongMessage(
+  chatId: number,
+  text: string,
+  opts: { replyToMessageId?: number } = {},
+): Promise<{ message_id: number }> {
+  const MAX = 4000;
+  if (text.length <= MAX) return await sendMessage(chatId, text, opts);
+  let first: { message_id: number } | undefined;
+  for (let i = 0; i < text.length; i += MAX) {
+    const chunk = text.slice(i, i + MAX);
+    const reply = await sendMessage(chatId, chunk, i === 0 ? opts : {});
+    if (!first) first = reply;
+  }
+  return first!;
+}
+
+export async function getFilePath(fileId: string): Promise<string> {
+  const file = await api().getFile(fileId);
+  if (!file.file_path)
+    throw new Error("Telegram returned a file without a file_path");
+  return file.file_path;
+}
+
+export async function downloadFile(filePath: string): Promise<Blob> {
+  const token = process.env.TELEGRAM_BOT_TOKEN!;
+  const res = await fetch(
+    `https://api.telegram.org/file/bot${token}/${filePath}`,
+  );
+  if (!res.ok) {
+    throw new Error(
+      `Failed to download voice file: ${res.status} ${res.statusText}`,
+    );
+  }
+  return await res.blob();
+}
+
+// Used by setup.ts for setWebhook / getWebhookInfo. Returns the raw result
+// from grammY so callers can read whatever fields they need.
+export async function setWebhook(opts: {
+  url: string;
+  secret_token: string;
+}): Promise<boolean> {
+  return await api().setWebhook(opts.url, {
+    secret_token: opts.secret_token,
+    // IMPORTANT: callback_query MUST be in this list, otherwise Telegram
+    // silently drops inline-keyboard button presses (the DM picker stops
+    // working). Re-run `npm run setup` whenever you change this list, the
+    // change is only picked up by setWebhook.
+    allowed_updates: [
+      "message",
+      "edited_message",
+      "business_connection",
+      "business_message",
+      "edited_business_message",
+      "guest_message",
+      "callback_query",
+    ] as any,
+    drop_pending_updates: false,
+  });
+}
+
+export async function getWebhookInfo(): Promise<{ url: string }> {
+  const info = await api().getWebhookInfo();
+  return { url: info.url ?? "" };
+}
