@@ -27,6 +27,7 @@ export type ModeKey =
   | "brief"
   | "cleanText"
   | "structured"
+  | "sections"
   | "actionItems"
   | "keyPoints";
 
@@ -82,6 +83,27 @@ export const MODES: Record<Exclude<ModeKey, "auto">, Mode> = {
     prompt: `Разбей summary на 2–5 тематических разделов. Каждый раздел начинается с короткого жирного подзаголовка (используй **заголовок**), под которым идёт несколько буллет-поинтов или короткий абзац.
 Выбирай разделы по смысловым блокам самого сообщения — не придумывай темы, которых нет в оригинале.
 Если в оригинале одна тема, используй один раздел.`,
+  },
+  sections: {
+    key: "sections",
+    label: "Темы",
+    description:
+      "Для длинных сообщений: TL;DR, затем каждая тема отдельной секцией с таймкодом, краткой сутью и подробным разбором в сворачиваемом блоке.",
+    prompt: `Разбей сообщение на смысловые темы и оформи каждую тему отдельной секцией.
+
+Структура ответа (соблюдай её точно):
+1. Первый абзац — TL;DR всего сообщения в 1–2 предложениях, без заголовка. Если тем больше одной, перечисли их одной строкой через «·».
+2. Дальше — по одному блоку на каждую тему, в хронологическом порядке:
+**⏱ M:SS · Название темы**
+Краткая суть темы в 1–3 предложениях — она должна быть понятна сама по себе.
+> Подробный пересказ темы: ключевые мысли, аргументы, детали, имена, цифры, выводы. Несколько абзацев и списки допустимы, но КАЖДАЯ строка подробного блока обязана начинаться с «> » — этот блок рендерится как сворачиваемая цитата.
+
+Правила:
+- Выделяй настоящие смысловые темы, обычно 2–8. Не дроби одну тему на несколько и не сливай разные в одну. Если тема реально одна — сделай одну секцию.
+- Таймкод темы — момент, где она начинается: возьми ближайшую метку [M:SS] из расшифровки. Формат «M:SS», при длительности от часа — «H:MM:SS».
+- Если в расшифровке нет меток времени, опусти «⏱ M:SS · » и оставь только жирное название темы.
+- Между секциями — пустая строка.
+- Насколько подробным делать свёрнутый блок каждой темы, определяет настройка детальности ниже.`,
   },
   actionItems: {
     key: "actionItems",
@@ -201,6 +223,60 @@ export const DETAIL_LEVELS: Record<Detail, string> = {
 Ориентир: полный пересказ, только без речевого мусора и повторов.`,
 };
 
+// ---- Timestamped transcripts ----------------------------------------------
+
+// Voices at least this long default to the "sections" mode when the chat
+// setting is "auto" — a 40-minute monologue about five different things
+// deserves per-topic timecodes, not one flat paragraph.
+export const LONG_VOICE_SECTIONS_MIN_SEC = 5 * 60;
+
+export interface TimedSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+// 6:05 / 1:02:45. Telegram clients auto-link timestamps in this shape when
+// the message replies to the media, so the reader can tap to seek.
+export function formatTimecode(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rest = s % 60;
+  const two = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${two(m)}:${two(rest)}` : `${m}:${two(rest)}`;
+}
+
+// Renders Whisper segments as `[M:SS] text` lines for the summarizer.
+// Adjacent segments are merged into ~30-second blocks — the model only
+// needs coarse anchors to attach topics to, and fewer markers cost fewer
+// tokens.
+const TIMESTAMP_BLOCK_TARGET_SEC = 30;
+
+export function formatTimestampedTranscript(segments: TimedSegment[]): string {
+  if (segments.length === 0) return "";
+  const lines: string[] = [];
+  let blockStart = segments[0].start;
+  let blockTexts: string[] = [];
+  const flush = () => {
+    if (blockTexts.length === 0) return;
+    lines.push(`[${formatTimecode(blockStart)}] ${blockTexts.join(" ")}`);
+    blockTexts = [];
+  };
+  for (const seg of segments) {
+    if (
+      blockTexts.length > 0 &&
+      seg.end - blockStart >= TIMESTAMP_BLOCK_TARGET_SEC
+    ) {
+      flush();
+      blockStart = seg.start;
+    }
+    blockTexts.push(seg.text);
+  }
+  flush();
+  return lines.join("\n");
+}
+
 // ---- Labels (including the "auto" pseudo-values) --------------------------
 
 export const AUTO_LABEL = "Авто";
@@ -261,6 +337,8 @@ export function buildSummaryPrompt(
 Отвечай на том же языке, на котором написана расшифровка.
 Не добавляй вступлений вроде «Вот ваше summary», сразу выдавай результат.
 Можешь использовать Markdown форматирование: **жирный**, *курсив*, \`код\`, \`\`\`код-блок\`\`\`, [ссылки](https://example.com). Списки и заголовки тоже можно.
+Строки, начинающиеся с «> », рендерятся как сворачиваемая цитата — используй их для объёмных деталей, которые читатель раскроет по желанию.
+Расшифровка может содержать метки времени вида [M:SS] в начале строк — это позиция в аудио. Сами метки в текст summary не копируй, кроме случаев, когда формат стиля явно требует таймкоды.
 
 === Стиль вывода (mode: ${mode}) ===
 ${m.prompt}
@@ -629,6 +707,7 @@ export const ALL_MODE_KEYS: ModeKey[] = [
   "brief",
   "cleanText",
   "structured",
+  "sections",
   "actionItems",
   "keyPoints",
 ];

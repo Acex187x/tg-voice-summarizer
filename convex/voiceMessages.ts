@@ -98,9 +98,26 @@ export const setStatus = internalMutation({
 });
 
 export const setTranscript = internalMutation({
-  args: { id: v.id("voiceMessages"), transcript: v.string() },
-  handler: async (ctx, { id, transcript }) => {
-    await ctx.db.patch(id, { transcript });
+  args: {
+    id: v.id("voiceMessages"),
+    transcript: v.string(),
+    segments: v.optional(
+      v.array(
+        v.object({
+          start: v.number(),
+          end: v.number(),
+          text: v.string(),
+        }),
+      ),
+    ),
+  },
+  handler: async (ctx, { id, transcript, segments }) => {
+    await ctx.db.patch(id, {
+      transcript,
+      ...(segments && segments.length > 0
+        ? { transcriptSegments: segments }
+        : {}),
+    });
   },
 });
 

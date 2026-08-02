@@ -24,6 +24,19 @@ export default defineSchema({
     // Short base62 id used in deep-links and callback_data.
     shortId: v.optional(v.string()),
     transcript: v.optional(v.string()),
+    // Segment-level timestamps from Whisper (verbose_json). Used to build
+    // the timestamped transcript that powers per-topic timecodes in the
+    // "sections" summary mode. Absent for old rows and for transcription
+    // models that can't produce timestamps.
+    transcriptSegments: v.optional(
+      v.array(
+        v.object({
+          start: v.number(),
+          end: v.number(),
+          text: v.string(),
+        }),
+      ),
+    ),
 
     // Router-resolved concrete values (mode/context that "auto" maps to
     // for this specific voice). Cached here so we don't re-run the router

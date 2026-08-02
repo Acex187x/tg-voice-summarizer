@@ -202,6 +202,119 @@ export async function editGuestMessageText(
   }
 }
 
+// ---- Rich messages (Bot API 10.1+) ----------------------------------------
+
+// Rich messages allow up to 32768 UTF-8 chars; leave headroom the same way
+// TG_TEXT_LIMIT does for classic messages.
+export const RICH_TEXT_LIMIT = 32000;
+
+// Sends a rich message with markdown content (GFM-compatible "Rich
+// Markdown": headings, tables, <details> collapsible blocks, …). grammY
+// doesn't know about Bot API 10.1 yet, so this goes through the raw HTTP
+// endpoint. Callers should be prepared to fall back to classic HTML
+// messages on error — old-client rendering of rich messages is
+// undocumented and server-side validation is stricter than parse_mode.
+export async function sendRichMarkdownMessage(
+  chatId: number,
+  markdown: string,
+  opts: { replyToMessageId?: number; inlineKeyboard?: InlineKeyboard } = {},
+): Promise<{ message_id: number }> {
+  return await rawTelegramMethod("sendRichMessage", {
+    chat_id: chatId,
+    rich_message: { markdown },
+    ...(opts.replyToMessageId !== undefined
+      ? {
+          reply_parameters: {
+            message_id: opts.replyToMessageId,
+            allow_sending_without_reply: true,
+          },
+        }
+      : {}),
+    ...(opts.inlineKeyboard
+      ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+      : {}),
+  });
+}
+
+// Edits an existing (plain or rich) bot message into a rich message.
+// editMessageText accepts rich_message as an alternative to text.
+export async function editIntoRichMarkdownMessage(
+  chatId: number,
+  messageId: number,
+  markdown: string,
+  opts: { inlineKeyboard?: InlineKeyboard } = {},
+): Promise<void> {
+  try {
+    await rawTelegramMethod("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      rich_message: { markdown },
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/message is not modified/i.test(msg)) throw err;
+  }
+}
+
+// Escapes text that goes into rich markdown as plain prose (transcripts).
+// Rich markdown may contain arbitrary HTML, so raw < / & in a transcript
+// could be parsed as tags.
+export function escapeRichText(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+}
+
+// Converts our summary-markdown conventions into Rich Markdown. The `> `
+// quote blocks that classic rendering turns into expandable blockquotes
+// become collapsed <details> blocks here — same "expand for the long
+// version" affordance, native to rich messages.
+export function summaryMarkdownToRichMarkdown(
+  md: string,
+  detailsLabel = "Подробнее",
+): string {
+  const out: string[] = [];
+  let quote: string[] | null = null;
+  const flushQuote = () => {
+    if (quote !== null) {
+      out.push(
+        `<details><summary>${detailsLabel}</summary>`,
+        "",
+        ...quote,
+        "",
+        "</details>",
+      );
+      quote = null;
+    }
+  };
+  for (const line of md.split("\n")) {
+    const m = line.match(/^\s*>\s?(.*)$/);
+    if (m) {
+      (quote ??= []).push(m[1]);
+    } else {
+      flushQuote();
+      out.push(line);
+    }
+  }
+  flushQuote();
+  return out.join("\n");
+}
+
+// Markdown-level counterpart of resolveMessageLinks: rewrites
+// `[text](msg:12345)` targets into t.me deep links before the markdown is
+// handed to sendRichMessage.
+export function resolveMessageLinksMarkdown(
+  md: string,
+  chatId: number,
+): string {
+  const channelId = String(chatId).replace(/^-100/, "");
+  return md.replace(
+    /\]\(msg:(\d+)\)/g,
+    (_m, msgId: string) => `](https://t.me/c/${channelId}/${msgId})`,
+  );
+}
+
 // Looks up our own bot username via getMe so we can build deep-link URLs
 // like t.me/<username>?start=… for group reply buttons.
 export async function getMe(): Promise<{
@@ -239,6 +352,64 @@ export function splitTextSafely(
   }
   if (rest.length > 0) chunks.push(rest);
   return chunks;
+}
+
+// Splits already-rendered Telegram HTML into chunks that fit the limit
+// WITHOUT tearing <blockquote> tags apart (a torn tag is a hard 400 from
+// the API). Text between quotes splits on the usual soft boundaries; a
+// quote that fits goes into a chunk whole; an oversized quote is split by
+// content and each part gets its own open/close tags, so every emitted
+// chunk is well-formed on its own.
+export function splitHtmlSafely(
+  html: string,
+  maxLen: number = TG_TEXT_LIMIT,
+): string[] {
+  if (html.length <= maxLen) return [html];
+  const OPEN = "<blockquote expandable>";
+  const CLOSE = "</blockquote>";
+
+  type Unit = { kind: "text" | "quote"; content: string };
+  const units: Unit[] = [];
+  const re = /<blockquote(?:\s+expandable)?>([\s\S]*?)<\/blockquote>/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    if (m.index > last)
+      units.push({ kind: "text", content: html.slice(last, m.index) });
+    units.push({ kind: "quote", content: m[1] });
+    last = m.index + m[0].length;
+  }
+  if (last < html.length)
+    units.push({ kind: "text", content: html.slice(last) });
+
+  const chunks: string[] = [];
+  let cur = "";
+  const append = (piece: string) => {
+    if (piece.length === 0) return;
+    if (cur.length + piece.length <= maxLen) {
+      cur += piece;
+      return;
+    }
+    if (cur.trim().length > 0) chunks.push(cur.trimEnd());
+    cur = piece.replace(/^\n+/, "");
+  };
+  for (const unit of units) {
+    if (unit.kind === "text") {
+      for (const part of splitTextSafely(unit.content, maxLen)) append(part);
+    } else {
+      const wrapped = `${OPEN}${unit.content}${CLOSE}`;
+      if (wrapped.length <= maxLen) {
+        append(wrapped);
+      } else {
+        const budget = maxLen - OPEN.length - CLOSE.length;
+        for (const part of splitTextSafely(unit.content, budget)) {
+          append(`${OPEN}${part}${CLOSE}`);
+        }
+      }
+    }
+  }
+  if (cur.trim().length > 0) chunks.push(cur.trimEnd());
+  return chunks.length > 0 ? chunks : [html.slice(0, maxLen)];
 }
 
 // Custom emoji used as a loading spinner in status messages. Rendered via
@@ -330,6 +501,31 @@ export function markdownToTelegramHtml(text: string): string {
 
   // 3e. Headings: # … ###### become bold.
   s = s.replace(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/gm, "<b>$1</b>");
+
+  // 3f. Blockquotes: runs of consecutive `> `-prefixed lines (escaped to
+  // `&gt;` by step 2) collapse into a single expandable blockquote. This
+  // is how summary prompts mark "details the reader expands on demand".
+  {
+    const out: string[] = [];
+    let quote: string[] | null = null;
+    const flushQuote = () => {
+      if (quote !== null) {
+        out.push(`<blockquote expandable>${quote.join("\n")}</blockquote>`);
+        quote = null;
+      }
+    };
+    for (const line of s.split("\n")) {
+      const m = line.match(/^\s*&gt;\s?(.*)$/);
+      if (m) {
+        (quote ??= []).push(m[1]);
+      } else {
+        flushQuote();
+        out.push(line);
+      }
+    }
+    flushQuote();
+    s = out.join("\n");
+  }
 
   // 4. Restore stashed code spans.
   s = s.replace(

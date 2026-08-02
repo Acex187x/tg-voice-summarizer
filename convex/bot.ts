@@ -3,7 +3,7 @@ import { internal } from "./_generated/api";
 import { internalAction } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
 import { TRANSCRIBE_MODEL } from "./models";
-import { transcribeAudio } from "./openai";
+import { transcribeAudioWithTimestamps } from "./openai";
 import {
   buildChatLogFor,
   buildChatSummaryButton,
@@ -24,6 +24,8 @@ import {
   CONTEXTS,
   contextLabel,
   DETAIL_LEVELS,
+  formatTimecode,
+  formatTimestampedTranscript,
   isContextKey,
   isDetail,
   isModeKey,
@@ -47,6 +49,7 @@ import {
   markdownToTelegramHtml,
   resolveMessageLinks,
   sendMessage,
+  splitHtmlSafely,
   splitTextSafely,
   TG_TEXT_LIMIT,
   type InlineKeyboard,
@@ -444,14 +447,22 @@ async function handleGuestMessage(
     await editGuestProgress(inlineMessageId, "Расшифровываю сообщение…");
     const voice = await getOrCreateGuestVoiceRecord(ctx, targetMessage, media);
     let transcript = voice.transcript;
+    let segments = voice.transcriptSegments ?? [];
     if (!transcript) {
       const filePath = await getFilePath(media.fileId);
       const audio = await downloadFile(filePath);
-      transcript = await transcribeAudio(audio, TRANSCRIBE_MODEL, "voice.ogg");
+      const result = await transcribeAudioWithTimestamps(
+        audio,
+        TRANSCRIBE_MODEL,
+        "voice.ogg",
+      );
+      transcript = result.text;
+      segments = result.segments;
       if (!transcript) throw new Error("Whisper returned empty transcript");
       await ctx.runMutation(internal.voiceMessages.setTranscript, {
         id: voice._id,
         transcript,
+        segments,
       });
     }
 
@@ -469,6 +480,8 @@ async function handleGuestMessage(
         : null;
     const summaryArgs = {
       transcript,
+      segments,
+      durationSec: voice.durationSec ?? null,
       mode: settings.mode,
       context: settings.context,
       detail: settings.detail,
@@ -587,6 +600,7 @@ async function resolveGuestVoiceSettings(
     voice._id,
     transcript,
     chatDefaults,
+    voice.durationSec,
   );
   return {
     mode: resolved.mode,
@@ -1311,10 +1325,18 @@ async function sendTranscriptMessages(
   if (voice.fromName)
     headerLines.push(`<b>От:</b> ${escapeHtml(voice.fromName)}`);
   if (voice.durationSec !== undefined) {
-    headerLines.push(`<b>Длительность:</b> ${voice.durationSec}s`);
+    headerLines.push(
+      `<b>Длительность:</b> ${formatTimecode(voice.durationSec)}`,
+    );
   }
   const header = headerLines.join("\n");
-  const transcriptHtml = escapeHtml(voice.transcript ?? "");
+  // Prefer the timestamped rendering when Whisper segments are stored —
+  // [M:SS] anchors make a long transcript navigable.
+  const transcriptText =
+    voice.transcriptSegments && voice.transcriptSegments.length > 0
+      ? formatTimestampedTranscript(voice.transcriptSegments)
+      : (voice.transcript ?? "");
+  const transcriptHtml = escapeHtml(transcriptText);
 
   const single = `${header}\n\n<blockquote expandable>${transcriptHtml}</blockquote>`;
   if (single.length <= TG_TEXT_LIMIT) {
@@ -1394,12 +1416,14 @@ function renderPickerMessage(state: PickerState, summary: string): string {
 
   // Truncate if the combination overshoots the limit — in the DM picker
   // we don't have room for a fallback link-prompt (we're already in the
-  // bot), so we soft-truncate the summary body.
+  // bot), so we soft-truncate the summary body. The cut goes through
+  // splitHtmlSafely so we never tear an expandable-blockquote tag apart.
   const settingsBlock = `\n\n${settingsLine}`;
   const limit = TG_TEXT_LIMIT - settingsBlock.length - 10;
   const body =
     summaryHtml.length > limit
-      ? summaryHtml.slice(0, limit - 30) + "\n\n<i>(summary обрезан)</i>"
+      ? splitHtmlSafely(summaryHtml, limit - 40)[0] +
+        "\n\n<i>(summary обрезан)</i>"
       : summaryHtml;
   return `${body}${settingsBlock}`;
 }
@@ -1570,6 +1594,8 @@ async function loadOrGenerateForSession(
       : null;
   const { text } = await getOrGenerateSummary(ctx, voice._id, {
     transcript: voice.transcript,
+    segments: voice.transcriptSegments ?? null,
+    durationSec: voice.durationSec ?? null,
     mode: mode as Exclude<ModeKey, "auto">,
     context: context as Exclude<ContextKey, "auto">,
     detail: session.detail,
@@ -1966,6 +1992,8 @@ async function applyToChat(
       : null;
   const { text: summary } = await getOrGenerateSummary(ctx, voice._id, {
     transcript: voice.transcript,
+    segments: voice.transcriptSegments ?? null,
+    durationSec: voice.durationSec ?? null,
     mode: mode as Exclude<ModeKey, "auto">,
     context: context as Exclude<ContextKey, "auto">,
     detail,
@@ -1985,6 +2013,7 @@ async function applyToChat(
   const rendered = renderFinal({
     summary,
     transcript: voice.transcript,
+    segments: voice.transcriptSegments ?? null,
     mode: mode as Exclude<ModeKey, "auto">,
     context: context as Exclude<ContextKey, "auto">,
     detail,
@@ -2183,7 +2212,8 @@ function renderChatSummaryPickerMessage(
   const limit = TG_TEXT_LIMIT - settingsBlock.length - headerBlock.length - 10;
   const body =
     summaryHtml.length > limit
-      ? summaryHtml.slice(0, limit - 30) + "\n\n<i>(summary обрезан)</i>"
+      ? splitHtmlSafely(summaryHtml, limit - 40)[0] +
+        "\n\n<i>(summary обрезан)</i>"
       : summaryHtml;
   return `${headerBlock}${body}${settingsBlock}`;
 }
