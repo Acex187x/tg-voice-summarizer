@@ -2,9 +2,16 @@ import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { internalAction } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
-import { TRANSCRIBE_MODEL } from "./models";
-import { transcribeAudio } from "./openai";
 import {
+  isSummarizeModelKey,
+  SUMMARIZE_MODEL_OPTIONS,
+  summarizeModelId,
+  TRANSCRIBE_MODEL,
+  type SummarizeModelKey,
+} from "./models";
+import { transcribeAudioWithTimestamps } from "./openai";
+import {
+  answerSummaryQuestion,
   buildChatLogFor,
   buildChatSummaryButton,
   buildOpenInBotKeyboard,
@@ -24,6 +31,8 @@ import {
   CONTEXTS,
   contextLabel,
   DETAIL_LEVELS,
+  formatTimecode,
+  formatTimestampedTranscript,
   isContextKey,
   isDetail,
   isModeKey,
@@ -38,6 +47,7 @@ import {
   answerCallbackQuery,
   deleteMessage,
   downloadFile,
+  editEphemeralMessageText,
   editGuestMessageText,
   editMessageReplyMarkup,
   editMessageText,
@@ -46,7 +56,9 @@ import {
   loadingEmoji,
   markdownToTelegramHtml,
   resolveMessageLinks,
+  sendEphemeralMessage,
   sendMessage,
+  splitHtmlSafely,
   splitTextSafely,
   TG_TEXT_LIMIT,
   type InlineKeyboard,
@@ -87,6 +99,9 @@ type TgMessage = {
   guest_query_id?: string;
   guest_bot_caller_user?: TgUser;
   guest_bot_caller_chat?: TgChat;
+  // Bot API 10.2: set for incoming ephemeral messages (ephemeral commands).
+  // Such messages have message_id 0 and are invisible in the chat.
+  ephemeral_message_id?: number;
   from?: TgUser;
   chat: TgChat;
   text?: string;
@@ -106,6 +121,14 @@ type TgCallbackQuery = {
   message?: TgMessage;
   data?: string;
 };
+type TgMessageReaction = {
+  chat: TgChat;
+  message_id: number;
+  user?: TgUser;
+  date?: number;
+  old_reaction?: unknown[];
+  new_reaction?: unknown[];
+};
 type TgUpdate = {
   update_id: number;
   message?: TgMessage;
@@ -115,6 +138,7 @@ type TgUpdate = {
   edited_business_message?: TgMessage;
   guest_message?: TgMessage;
   callback_query?: TgCallbackQuery;
+  message_reaction?: TgMessageReaction;
 };
 
 // ---- Env helpers ----------------------------------------------------------
@@ -146,6 +170,8 @@ const HELP_TEXT = `Команды админа:
 /summarize — ответьте этой командой на голосовое или видеокружок, чтобы пересобрать summary
 /search <запрос> — найти сообщения в истории чата по смыслу
 /ask <вопрос> — коротко ответить на вопрос по истории чата с доказательными ссылками
+/modal — выбрать модель суммаризации для чата (эфемерный переключатель)
+/quiet — тихий режим: summary не постятся, реакция на войс присылает их эфемерно
 /importdump — загрузить Telegram JSON export (result.json) и проиндексировать историю
 /indexstats — статистика покрытия БД и векторного индекса для этого чата
 /indexstats rebuild — пересобрать сохранённые счётчики
@@ -187,6 +213,13 @@ export const handleUpdate = internalAction({
       return;
     }
 
+    // Reactions (bot must be a chat admin to receive these). Powers the
+    // quiet-mode "react to get an ephemeral summary" flow.
+    if (u.message_reaction) {
+      await handleMessageReaction(ctx, u.message_reaction);
+      return;
+    }
+
     const message = u.message ?? u.edited_message;
     if (!message) return;
 
@@ -201,7 +234,7 @@ export const handleUpdate = internalAction({
     //    a background memory refresh for the chat (the action itself
     //    self-deduplicates by lastUpdatedAt — so this is essentially
     //    free if we're inside the 6h window).
-    if (!isPrivateChat) {
+    if (!isPrivateChat && message.ephemeral_message_id === undefined) {
       const chatMessageId = await storeChatMessage(ctx, message);
       await ctx.scheduler.runAfter(0, internal.vectorSearch.indexChatMessage, {
         chatMessageId,
@@ -271,6 +304,18 @@ export const handleUpdate = internalAction({
       return;
     }
 
+    // 3a-bis. /modal — per-chat summarizer model toggle, /quiet — quiet
+    // mode. Both registered as ephemeral commands (invisible in chat);
+    // any group member can use them.
+    if (!isPrivateChat && /^\/modal(?:@[\w_]+)?(?:\s|$)/i.test(commandText)) {
+      await handleModalCommand(ctx, message);
+      return;
+    }
+    if (!isPrivateChat && /^\/quiet(?:@[\w_]+)?(?:\s|$)/i.test(commandText)) {
+      await handleQuietCommand(ctx, message);
+      return;
+    }
+
     if (/^\/importdump(?:@[\w_]+)?(?:\s|$)/i.test(commandText)) {
       if (!isAdmin) {
         if (isPrivateChat) {
@@ -317,6 +362,18 @@ export const handleUpdate = internalAction({
     ) {
       await handleLoreCommand(ctx, message);
       return;
+    }
+
+    // 3c. Reply-to-summary Q&A — any group member replying (plain text,
+    // not a command) to one of the bot's summary or Q&A messages gets an
+    // answer grounded in the summary + full transcript/log.
+    if (
+      !isPrivateChat &&
+      message.reply_to_message &&
+      !commandText.startsWith("/")
+    ) {
+      const handled = await maybeAnswerSummaryReply(ctx, message, commandText);
+      if (handled) return;
     }
 
     // 4. Admin-only commands.
@@ -422,10 +479,11 @@ async function handleGuestMessage(
     : message.reply_to_message;
   const media = targetMessage ? extractMedia(targetMessage) : null;
   if (!targetMessage || !media) {
-    await answerGuestWithText(
-      guestQueryId,
-      "Нужно вызвать бота ответом на голосовое, аудио или видеокружок.",
-    );
+    // No voice anywhere in sight. This fires not only on genuine
+    // mis-summons but on EVERY reply to the bot's own guest answer —
+    // Telegram sends those as guest updates too, and answering them used
+    // to drop a stray system-looking message into the group. Ignore
+    // silently: an unanswered guest query just expires without a trace.
     return;
   }
 
@@ -444,14 +502,22 @@ async function handleGuestMessage(
     await editGuestProgress(inlineMessageId, "Расшифровываю сообщение…");
     const voice = await getOrCreateGuestVoiceRecord(ctx, targetMessage, media);
     let transcript = voice.transcript;
+    let segments = voice.transcriptSegments ?? [];
     if (!transcript) {
       const filePath = await getFilePath(media.fileId);
       const audio = await downloadFile(filePath);
-      transcript = await transcribeAudio(audio, TRANSCRIBE_MODEL, "voice.ogg");
+      const result = await transcribeAudioWithTimestamps(
+        audio,
+        TRANSCRIBE_MODEL,
+        "voice.ogg",
+      );
+      transcript = result.text;
+      segments = result.segments;
       if (!transcript) throw new Error("Whisper returned empty transcript");
       await ctx.runMutation(internal.voiceMessages.setTranscript, {
         id: voice._id,
         transcript,
+        segments,
       });
     }
 
@@ -467,13 +533,20 @@ async function handleGuestMessage(
       loreRows && loreRows.length > 0
         ? loreRows.map((r: any) => `- ${r.text}`).join("\n")
         : null;
+    const guestChatSettings = await ctx.runQuery(
+      internal.chatSettings.getResolved,
+      { chatId: voice.chatId },
+    );
     const summaryArgs = {
       transcript,
+      segments,
+      durationSec: voice.durationSec ?? null,
       mode: settings.mode,
       context: settings.context,
       detail: settings.detail,
       chatStyleNotes: memory?.notes ?? null,
       chatLore: lore,
+      modelId: summarizeModelId(guestChatSettings.summarizeModelKey),
     };
     const { text: summary } = inlineMessageId
       ? await getOrGenerateSummaryStreaming(
@@ -587,6 +660,7 @@ async function resolveGuestVoiceSettings(
     voice._id,
     transcript,
     chatDefaults,
+    voice.durationSec,
   );
   return {
     mode: resolved.mode,
@@ -812,7 +886,16 @@ async function handleVoice(
   const ackChatId = opts.privateResult
     ? opts.businessUserChatId
     : message.chat.id;
-  if (ackChatId !== undefined) {
+  // Quiet mode: no public "Обрабатываю…" placeholder in groups — the
+  // pipeline runs silently and reactions serve the result ephemerally.
+  let quiet = false;
+  if (!opts.privateResult && message.chat.type !== "private") {
+    const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+      chatId: message.chat.id,
+    });
+    quiet = settings.quietMode;
+  }
+  if (ackChatId !== undefined && !quiet) {
     try {
       const ack = await sendMessage(
         ackChatId,
@@ -976,6 +1059,373 @@ type ChatMediaKind =
   | "document"
   | "sticker"
   | "other";
+
+// ---- /modal: per-chat summarizer model toggle -----------------------------
+
+function renderModalPanel(activeKey: SummarizeModelKey): string {
+  const lines = (
+    Object.keys(SUMMARIZE_MODEL_OPTIONS) as SummarizeModelKey[]
+  ).map((key) => {
+    const opt = SUMMARIZE_MODEL_OPTIONS[key];
+    return `${key === activeKey ? "●" : "○"} ${opt.label} — <code>${opt.id}</code>`;
+  });
+  return `<b>Модель суммаризации в этом чате</b>\n${lines.join("\n")}`;
+}
+
+function buildModalKeyboard(
+  chatId: number,
+  activeKey: SummarizeModelKey,
+  ephemeralId: number,
+): InlineKeyboard {
+  return [
+    (Object.keys(SUMMARIZE_MODEL_OPTIONS) as SummarizeModelKey[]).map(
+      (key) => ({
+        text:
+          key === activeKey
+            ? `✓ ${SUMMARIZE_MODEL_OPTIONS[key].label}`
+            : SUMMARIZE_MODEL_OPTIONS[key].label,
+        callback_data: `mm:${chatId}:${key}:${ephemeralId}`,
+      }),
+    ),
+  ];
+}
+
+async function handleModalCommand(
+  ctx: { runMutation: any; runQuery: any },
+  message: TgMessage,
+): Promise<void> {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  if (!userId) return;
+  const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  });
+  const text = renderModalPanel(settings.summarizeModelKey);
+
+  // Ephemeral path: works when /modal came in as an ephemeral command
+  // (reply within 15s) or when the bot is a chat admin.
+  const eph = await sendEphemeralMessage(chatId, userId, text, {
+    parseMode: "HTML",
+    inlineKeyboard: buildModalKeyboard(chatId, settings.summarizeModelKey, 0),
+    replyToEphemeralMessageId: message.ephemeral_message_id,
+  });
+  if (eph?.ephemeral_message_id) {
+    // Re-issue the keyboard with the real ephemeral id baked into the
+    // callback data, so toggles can edit this panel in place.
+    await editEphemeralMessageText(
+      chatId,
+      userId,
+      eph.ephemeral_message_id,
+      text,
+      {
+        parseMode: "HTML",
+        inlineKeyboard: buildModalKeyboard(
+          chatId,
+          settings.summarizeModelKey,
+          eph.ephemeral_message_id,
+        ),
+      },
+    );
+    return;
+  }
+  if (!eph) {
+    await sendMessage(chatId, text, {
+      parseMode: "HTML",
+      inlineKeyboard: buildModalKeyboard(chatId, settings.summarizeModelKey, 0),
+      replyToMessageId: message.message_id || undefined,
+    });
+  }
+}
+
+// mm:<chatId>:<modelKey>:<ephemeralId>
+async function handleModalCallback(
+  ctx: { runMutation: any; runQuery: any },
+  cb: TgCallbackQuery,
+  parts: string[],
+): Promise<void> {
+  if (parts.length !== 4) {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+  const chatId = Number(parts[1]);
+  const key = parts[2];
+  const ephemeralId = Number(parts[3]);
+  if (!Number.isFinite(chatId) || !isSummarizeModelKey(key)) {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+  await ctx.runMutation(internal.chatSettings.setSummarizeModel, {
+    chatId,
+    modelKey: key,
+  });
+  await answerCallbackQuery(
+    cb.id,
+    `Модель: ${SUMMARIZE_MODEL_OPTIONS[key].label}`,
+  );
+  const text = renderModalPanel(key);
+  const keyboard = buildModalKeyboard(chatId, key, ephemeralId);
+  if (ephemeralId) {
+    await editEphemeralMessageText(chatId, cb.from.id, ephemeralId, text, {
+      parseMode: "HTML",
+      inlineKeyboard: keyboard,
+    });
+  } else if (cb.message) {
+    await editMessageText(cb.message.chat.id, cb.message.message_id, text, {
+      parseMode: "HTML",
+      inlineKeyboard: keyboard,
+    });
+  }
+}
+
+// ---- /quiet: quiet mode toggle --------------------------------------------
+
+async function handleQuietCommand(
+  ctx: { runMutation: any; runQuery: any },
+  message: TgMessage,
+): Promise<void> {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  if (!userId) return;
+  const enabled: boolean = await ctx.runMutation(
+    internal.chatSettings.toggleQuietMode,
+    { chatId },
+  );
+  const text = enabled
+    ? "🤫 Тихий режим включён. Summary больше не постятся в чат: обработанное голосовое бот помечает реакцией 👀, а ваша реакция на голосовое присылает вам summary эфемерно — видно только вам. Для реакций и эфемерных сообщений бот должен быть админом чата."
+    : "🔊 Тихий режим выключен — summary снова постятся в чат.";
+  const eph = await sendEphemeralMessage(chatId, userId, text, {
+    replyToEphemeralMessageId: message.ephemeral_message_id,
+  });
+  if (!eph) {
+    await sendMessage(chatId, text, {
+      replyToMessageId: message.message_id || undefined,
+    });
+  }
+}
+
+// ---- Reactions → ephemeral summary (quiet mode) ---------------------------
+
+async function handleMessageReaction(
+  ctx: { runMutation: any; runQuery: any },
+  mr: TgMessageReaction,
+): Promise<void> {
+  const user = mr.user;
+  // Ignore reaction removals and anonymous/channel reactions.
+  if (!user || (mr.new_reaction?.length ?? 0) === 0) return;
+  const chatId = mr.chat.id;
+  const voice = (await ctx.runQuery(internal.voiceMessages.findByMessage, {
+    chatId,
+    messageId: mr.message_id,
+  })) as Doc<"voiceMessages"> | null;
+  if (!voice) return;
+  const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  });
+  if (!settings.quietMode) return;
+
+  if (voice.status !== "done" || !voice.transcript) {
+    await sendEphemeralMessage(
+      chatId,
+      user.id,
+      `${loadingEmoji()} <i>Ещё обрабатываю это голосовое — поставьте реакцию чуть позже.</i>`,
+      { parseMode: "HTML" },
+    );
+    return;
+  }
+
+  const session = {
+    mode: (voice.displayedMode ?? "auto") as ModeKey,
+    context: (voice.displayedContext ?? "auto") as ContextKey,
+    detail: (voice.displayedDetail ?? settings.detail) as Detail,
+  };
+  const summary = await loadOrGenerateForSession(ctx, voice, session);
+  const summaryHtml = markdownToTelegramHtml(summary);
+  let body = `${summaryHtml}\n\n<blockquote expandable>${escapeHtml(voice.transcript)}</blockquote>`;
+  if (body.length > TG_TEXT_LIMIT) {
+    // Drop the transcript quote first; truncate the summary as a last
+    // resort (tag-safe).
+    body =
+      summaryHtml.length <= TG_TEXT_LIMIT
+        ? summaryHtml
+        : splitHtmlSafely(summaryHtml, TG_TEXT_LIMIT - 60)[0] +
+          "\n\n<i>(обрезано — полная версия в боте)</i>";
+  }
+  const botUsername = await ctx.runQuery(internal.botConfig.getBotUsername, {});
+  const keyboard: InlineKeyboard | undefined =
+    botUsername && voice.shortId
+      ? [
+          [
+            {
+              text: "Открыть в боте",
+              url: `https://t.me/${botUsername}?start=v${voice.shortId}`,
+            },
+          ],
+        ]
+      : undefined;
+  await sendEphemeralMessage(chatId, user.id, body, {
+    parseMode: "HTML",
+    inlineKeyboard: keyboard,
+  });
+}
+
+// ---- Reply-to-summary Q&A -------------------------------------------------
+
+// Resolves the replied-to bot message back to its source voice / chat
+// summary (directly or through a previous Q&A answer) and answers the
+// question. Returns false if the reply target isn't ours.
+async function maybeAnswerSummaryReply(
+  ctx: { runMutation: any; runQuery: any },
+  message: TgMessage,
+  question: string,
+): Promise<boolean> {
+  const chatId = message.chat.id;
+  const target = message.reply_to_message;
+  if (!target) return false;
+  const targetId = target.message_id;
+
+  let voice = (await ctx.runQuery(internal.voiceMessages.findByAckMessage, {
+    chatId,
+    ackMessageId: targetId,
+  })) as Doc<"voiceMessages"> | null;
+  let chatSummary: Doc<"chatSummaries"> | null = null;
+  let quotedAnswer: string | null = null;
+  if (!voice) {
+    chatSummary = (await ctx.runQuery(internal.chatSummaries.findByAckMessage, {
+      chatId,
+      ackMessageId: targetId,
+    })) as Doc<"chatSummaries"> | null;
+  }
+  if (!voice && !chatSummary) {
+    // Maybe it's a reply to one of our earlier Q&A answers — follow-up.
+    const qa = await ctx.runQuery(internal.qaMessages.findByMessage, {
+      chatId,
+      messageId: targetId,
+    });
+    if (!qa) return false;
+    quotedAnswer = target.text ?? null;
+    if (qa.voiceShortId) {
+      voice = (await ctx.runQuery(internal.voiceMessages.getByShortId, {
+        shortId: qa.voiceShortId,
+      })) as Doc<"voiceMessages"> | null;
+    } else if (qa.chatSummaryShortId) {
+      chatSummary = (await ctx.runQuery(internal.chatSummaries.getByShortId, {
+        shortId: qa.chatSummaryShortId,
+      })) as Doc<"chatSummaries"> | null;
+    }
+  }
+  if (voice && (voice.status !== "done" || !voice.transcript)) return false;
+  if (chatSummary && chatSummary.status !== "done") return false;
+  if (!voice && !chatSummary) return false;
+
+  await answerSummaryQuestion(ctx, {
+    chatId,
+    question,
+    questionMessageId: message.message_id,
+    voice,
+    chatSummary,
+    quotedAnswer,
+  });
+  return true;
+}
+
+// ---- In-group ephemeral style switcher (voice author) ---------------------
+
+const GROUP_STYLE_MODE_KEYS: Exclude<ModeKey, "auto">[] = [
+  "bulletPoints",
+  "brief",
+  "cleanText",
+  "structured",
+  "sections",
+  "actionItems",
+  "keyPoints",
+];
+
+// gs:<shortId> — opens an ephemeral mode picker for the voice author.
+// Uses the callback's 15-second window, so it works without admin rights.
+async function openGroupStylePicker(
+  ctx: { runQuery: any },
+  cb: TgCallbackQuery,
+  shortId: string,
+): Promise<void> {
+  const voice = (await ctx.runQuery(internal.voiceMessages.getByShortId, {
+    shortId,
+  })) as Doc<"voiceMessages"> | null;
+  if (!voice) {
+    await answerCallbackQuery(cb.id, "Сообщение не найдено");
+    return;
+  }
+  if (cb.from.id !== voice.fromId) {
+    await answerCallbackQuery(
+      cb.id,
+      "Только автор голосового может менять стиль в чате",
+      true,
+    );
+    return;
+  }
+  const current = voice.displayedMode ?? voice.autoMode;
+  const rows: InlineKeyboard = [];
+  for (let i = 0; i < GROUP_STYLE_MODE_KEYS.length; i += 2) {
+    rows.push(
+      GROUP_STYLE_MODE_KEYS.slice(i, i + 2).map((k) => ({
+        text: k === current ? `✓ ${modeLabel(k)}` : modeLabel(k),
+        callback_data: `ga:${shortId}:${k}`,
+      })),
+    );
+  }
+  const eph = await sendEphemeralMessage(
+    voice.chatId,
+    cb.from.id,
+    "Стиль summary для этого голосового (пикер видно только вам):",
+    { callbackQueryId: cb.id, inlineKeyboard: rows },
+  );
+  if (eph) {
+    await answerCallbackQuery(cb.id);
+  } else {
+    await answerCallbackQuery(
+      cb.id,
+      "Не удалось открыть пикер — используйте «Открыть в боте»",
+      true,
+    );
+  }
+}
+
+// ga:<shortId>:<modeKey> — regenerates the group summary with a new mode.
+async function applyGroupStyle(
+  ctx: { runMutation: any; runQuery: any },
+  cb: TgCallbackQuery,
+  shortId: string,
+  modeRaw: string,
+): Promise<void> {
+  const voice = (await ctx.runQuery(internal.voiceMessages.getByShortId, {
+    shortId,
+  })) as Doc<"voiceMessages"> | null;
+  if (!voice) {
+    await answerCallbackQuery(cb.id, "Сообщение не найдено");
+    return;
+  }
+  if (cb.from.id !== voice.fromId) {
+    await answerCallbackQuery(cb.id, "Только автор голосового", true);
+    return;
+  }
+  if (!voice.transcript) {
+    await answerCallbackQuery(cb.id, "Расшифровка отсутствует");
+    return;
+  }
+  if (!isModeKey(modeRaw) || modeRaw === "auto") {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+  const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId: voice.chatId,
+  });
+  const context = (voice.displayedContext ??
+    voice.autoContext ??
+    (settings.context !== "auto" ? settings.context : "thinkingOutLoud")) as
+    Exclude<ContextKey, "auto">;
+  const detail = (voice.displayedDetail ?? settings.detail) as Detail;
+  await answerCallbackQuery(cb.id, "Обновляю summary в чате…");
+  await regenerateVoiceInChat(ctx, voice, modeRaw, context, detail);
+}
 
 function detectChatMediaKind(message: TgMessage): ChatMediaKind {
   if (message.voice) return "voice";
@@ -1311,10 +1761,18 @@ async function sendTranscriptMessages(
   if (voice.fromName)
     headerLines.push(`<b>От:</b> ${escapeHtml(voice.fromName)}`);
   if (voice.durationSec !== undefined) {
-    headerLines.push(`<b>Длительность:</b> ${voice.durationSec}s`);
+    headerLines.push(
+      `<b>Длительность:</b> ${formatTimecode(voice.durationSec)}`,
+    );
   }
   const header = headerLines.join("\n");
-  const transcriptHtml = escapeHtml(voice.transcript ?? "");
+  // Prefer the timestamped rendering when Whisper segments are stored —
+  // [M:SS] anchors make a long transcript navigable.
+  const transcriptText =
+    voice.transcriptSegments && voice.transcriptSegments.length > 0
+      ? formatTimestampedTranscript(voice.transcriptSegments)
+      : (voice.transcript ?? "");
+  const transcriptHtml = escapeHtml(transcriptText);
 
   const single = `${header}\n\n<blockquote expandable>${transcriptHtml}</blockquote>`;
   if (single.length <= TG_TEXT_LIMIT) {
@@ -1394,12 +1852,14 @@ function renderPickerMessage(state: PickerState, summary: string): string {
 
   // Truncate if the combination overshoots the limit — in the DM picker
   // we don't have room for a fallback link-prompt (we're already in the
-  // bot), so we soft-truncate the summary body.
+  // bot), so we soft-truncate the summary body. The cut goes through
+  // splitHtmlSafely so we never tear an expandable-blockquote tag apart.
   const settingsBlock = `\n\n${settingsLine}`;
   const limit = TG_TEXT_LIMIT - settingsBlock.length - 10;
   const body =
     summaryHtml.length > limit
-      ? summaryHtml.slice(0, limit - 30) + "\n\n<i>(summary обрезан)</i>"
+      ? splitHtmlSafely(summaryHtml, limit - 40)[0] +
+        "\n\n<i>(summary обрезан)</i>"
       : summaryHtml;
   return `${body}${settingsBlock}`;
 }
@@ -1568,13 +2028,19 @@ async function loadOrGenerateForSession(
     loreRows && loreRows.length > 0
       ? loreRows.map((r: any) => `- ${r.text}`).join("\n")
       : null;
+  const chatSettings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId: voice.chatId,
+  });
   const { text } = await getOrGenerateSummary(ctx, voice._id, {
     transcript: voice.transcript,
+    segments: voice.transcriptSegments ?? null,
+    durationSec: voice.durationSec ?? null,
     mode: mode as Exclude<ModeKey, "auto">,
     context: context as Exclude<ContextKey, "auto">,
     detail: session.detail,
     chatStyleNotes: memory?.notes ?? null,
     chatLore: lore,
+    modelId: summarizeModelId(chatSettings.summarizeModelKey),
   });
   return text;
 }
@@ -1586,6 +2052,30 @@ async function handleCallback(
   cb: TgCallbackQuery,
 ): Promise<void> {
   const data = cb.data ?? "";
+  const parts = data.split(":");
+
+  // Ephemeral-capable callbacks first: they carry everything they need in
+  // callback_data because ephemeral-origin callbacks may arrive without a
+  // usable cb.message (ephemeral messages have message_id 0).
+  try {
+    if (parts[0] === "mm") {
+      await handleModalCallback(ctx, cb, parts);
+      return;
+    }
+    if (parts[0] === "gs" && parts.length === 2) {
+      await openGroupStylePicker(ctx, cb, parts[1]);
+      return;
+    }
+    if (parts[0] === "ga" && parts.length === 3) {
+      await applyGroupStyle(ctx, cb, parts[1], parts[2]);
+      return;
+    }
+  } catch (err) {
+    console.error("handleCallback (ephemeral) failed", err);
+    await answerCallbackQuery(cb.id, "Что-то сломалось").catch(() => {});
+    return;
+  }
+
   const chatId = cb.message?.chat.id;
   const messageId = cb.message?.message_id;
   const userId = cb.from.id;
@@ -1593,8 +2083,6 @@ async function handleCallback(
     await answerCallbackQuery(cb.id);
     return;
   }
-
-  const parts = data.split(":");
   // Voice picker callback formats:
   //   v:<sid>:<view>     — open a sub-view (mode|context|detail)
   //   bk:<sid>           — back to main view
@@ -1953,7 +2441,35 @@ async function applyToChat(
   if (mode === "auto" || context === "auto") return;
   const detail = session.detail as Detail;
 
+  await regenerateVoiceInChat(
+    ctx,
+    voice,
+    mode as Exclude<ModeKey, "auto">,
+    context as Exclude<ContextKey, "auto">,
+    detail,
+    session.mode === "auto",
+    session.context === "auto",
+  );
+}
+
+// Regenerates (or pulls from cache) a summary with the given concrete
+// settings and commits it into the voice's message in the source chat.
+// Shared by the DM picker's "apply to chat" and the in-group ephemeral
+// style switcher.
+async function regenerateVoiceInChat(
+  ctx: { runMutation: any; runQuery: any },
+  voice: Doc<"voiceMessages">,
+  mode: Exclude<ModeKey, "auto">,
+  context: Exclude<ContextKey, "auto">,
+  detail: Detail,
+  wasAutoMode = false,
+  wasAutoContext = false,
+): Promise<void> {
+  if (!voice.transcript) return;
   const debugMode = await ctx.runQuery(internal.botConfig.getDebugMode, {});
+  const chatSettings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId: voice.chatId,
+  });
   const memory = await ctx.runQuery(internal.chatMemory.get, {
     chatId: voice.chatId,
   });
@@ -1966,11 +2482,14 @@ async function applyToChat(
       : null;
   const { text: summary } = await getOrGenerateSummary(ctx, voice._id, {
     transcript: voice.transcript,
-    mode: mode as Exclude<ModeKey, "auto">,
-    context: context as Exclude<ContextKey, "auto">,
+    segments: voice.transcriptSegments ?? null,
+    durationSec: voice.durationSec ?? null,
+    mode,
+    context,
     detail,
     chatStyleNotes: memory?.notes ?? null,
     chatLore: lore,
+    modelId: summarizeModelId(chatSettings.summarizeModelKey),
   });
 
   // Mark as currently-displayed so debug info + future applies are correct.
@@ -1985,11 +2504,12 @@ async function applyToChat(
   const rendered = renderFinal({
     summary,
     transcript: voice.transcript,
-    mode: mode as Exclude<ModeKey, "auto">,
-    context: context as Exclude<ContextKey, "auto">,
+    segments: voice.transcriptSegments ?? null,
+    mode,
+    context,
     detail,
-    wasAutoMode: session.mode === "auto",
-    wasAutoContext: session.context === "auto",
+    wasAutoMode,
+    wasAutoContext,
     timings: {},
     debug: debugMode,
   });
@@ -2183,7 +2703,8 @@ function renderChatSummaryPickerMessage(
   const limit = TG_TEXT_LIMIT - settingsBlock.length - headerBlock.length - 10;
   const body =
     summaryHtml.length > limit
-      ? summaryHtml.slice(0, limit - 30) + "\n\n<i>(summary обрезан)</i>"
+      ? splitHtmlSafely(summaryHtml, limit - 40)[0] +
+        "\n\n<i>(summary обрезан)</i>"
       : summaryHtml;
   return `${headerBlock}${body}${settingsBlock}`;
 }
@@ -2399,6 +2920,9 @@ async function loadOrGenerateChatSummaryForSession(
     loreRows && loreRows.length > 0
       ? loreRows.map((r: any) => `- ${r.text}`).join("\n")
       : null;
+  const chatSettings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId: summary.chatId,
+  });
   const { text } = await getOrGenerateChatSummary(ctx, summary._id, {
     chatLog,
     mode: concrete.mode,
@@ -2406,6 +2930,7 @@ async function loadOrGenerateChatSummaryForSession(
     detail: concrete.detail,
     chatStyleNotes: memory?.notes ?? null,
     chatLore: lore,
+    modelId: summarizeModelId(chatSettings.summarizeModelKey),
   });
   return text;
 }
@@ -2696,6 +3221,10 @@ async function applyChatSummaryToChat(
     loreRows && loreRows.length > 0
       ? loreRows.map((r: any) => `- ${r.text}`).join("\n")
       : null;
+  const applyChatSettings = await ctx.runQuery(
+    internal.chatSettings.getResolved,
+    { chatId: summary.chatId },
+  );
   const { text: summaryText } = await getOrGenerateChatSummary(
     ctx,
     summary._id,
@@ -2706,6 +3235,7 @@ async function applyChatSummaryToChat(
       detail,
       chatStyleNotes: memory?.notes ?? null,
       chatLore: lore,
+      modelId: summarizeModelId(applyChatSettings.summarizeModelKey),
     },
   );
 

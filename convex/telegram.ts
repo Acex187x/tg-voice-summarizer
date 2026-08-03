@@ -202,6 +202,275 @@ export async function editGuestMessageText(
   }
 }
 
+// ---- Reactions (Bot API 7.0+) ---------------------------------------------
+
+// Sets (or clears, with no emoji) the bot's reaction on a message. Bots
+// get one reaction from the fixed emoji set. Used in quiet mode to signal
+// "processed — react to get the summary".
+export async function setMessageReaction(
+  chatId: number,
+  messageId: number,
+  emoji?: string,
+): Promise<void> {
+  try {
+    await rawTelegramMethod("setMessageReaction", {
+      chat_id: chatId,
+      message_id: messageId,
+      reaction: emoji ? [{ type: "emoji", emoji }] : [],
+    });
+  } catch (err) {
+    console.warn(
+      "setMessageReaction failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+// ---- Ephemeral messages (Bot API 10.2) ------------------------------------
+
+// Sends a message visible only to `receiverUserId` in a group chat.
+// Conditions (per Bot API docs):
+//   • any bot — within 15s of a callback query (pass callbackQueryId) or
+//     of an incoming ephemeral message (pass replyToEphemeralMessageId);
+//   • admin bot — to any non-bot member at any time, no trigger needed.
+// Ephemeral messages have message_id 0; the real handle is
+// ephemeral_message_id. Returns null on failure so callers can fall back
+// to a regular send.
+export async function sendEphemeralMessage(
+  chatId: number,
+  receiverUserId: number,
+  text: string,
+  opts: {
+    callbackQueryId?: string;
+    replyToEphemeralMessageId?: number;
+    parseMode?: ParseMode;
+    inlineKeyboard?: InlineKeyboard;
+  } = {},
+): Promise<{ ephemeral_message_id?: number } | null> {
+  try {
+    const result = await rawTelegramMethod<{
+      message_id: number;
+      ephemeral_message_id?: number;
+    }>("sendMessage", {
+      chat_id: chatId,
+      receiver_user_id: receiverUserId,
+      text,
+      link_preview_options: { is_disabled: true },
+      ...(opts.callbackQueryId
+        ? { callback_query_id: opts.callbackQueryId }
+        : {}),
+      ...(opts.replyToEphemeralMessageId !== undefined
+        ? {
+            reply_parameters: {
+              ephemeral_message_id: opts.replyToEphemeralMessageId,
+            },
+          }
+        : {}),
+      ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+    return { ephemeral_message_id: result.ephemeral_message_id };
+  } catch (err) {
+    console.warn(
+      "sendEphemeralMessage failed",
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
+}
+
+export async function editEphemeralMessageText(
+  chatId: number,
+  receiverUserId: number,
+  ephemeralMessageId: number,
+  text: string,
+  opts: { parseMode?: ParseMode; inlineKeyboard?: InlineKeyboard } = {},
+): Promise<boolean> {
+  try {
+    await rawTelegramMethod("editEphemeralMessageText", {
+      chat_id: chatId,
+      receiver_user_id: receiverUserId,
+      ephemeral_message_id: ephemeralMessageId,
+      text,
+      link_preview_options: { is_disabled: true },
+      ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/message is not modified/i.test(msg)) return true;
+    console.warn("editEphemeralMessageText failed", msg);
+    return false;
+  }
+}
+
+export async function deleteEphemeralMessage(
+  chatId: number,
+  receiverUserId: number,
+  ephemeralMessageId: number,
+): Promise<void> {
+  try {
+    await rawTelegramMethod("deleteEphemeralMessage", {
+      chat_id: chatId,
+      receiver_user_id: receiverUserId,
+      ephemeral_message_id: ephemeralMessageId,
+    });
+  } catch (err) {
+    console.warn(
+      "deleteEphemeralMessage failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+// Registers the bot's command list. Commands marked ephemeral are
+// invisible in the chat when sent (Bot API 10.2 BotCommand.is_ephemeral)
+// and let the bot answer ephemerally without being an admin.
+export async function setMyCommands(
+  commands: Array<{
+    command: string;
+    description: string;
+    is_ephemeral?: boolean;
+  }>,
+): Promise<void> {
+  await rawTelegramMethod("setMyCommands", { commands });
+}
+
+// "typing…" indicator while the Q&A model thinks.
+export async function sendChatAction(
+  chatId: number,
+  action = "typing",
+): Promise<void> {
+  try {
+    await rawTelegramMethod("sendChatAction", { chat_id: chatId, action });
+  } catch {
+    // cosmetic, ignore
+  }
+}
+
+// ---- Rich messages (Bot API 10.1+) ----------------------------------------
+
+// Rich messages allow up to 32768 UTF-8 chars; leave headroom the same way
+// TG_TEXT_LIMIT does for classic messages.
+export const RICH_TEXT_LIMIT = 32000;
+
+// Sends a rich message with markdown content (GFM-compatible "Rich
+// Markdown": headings, tables, <details> collapsible blocks, …). grammY
+// doesn't know about Bot API 10.1 yet, so this goes through the raw HTTP
+// endpoint. Callers should be prepared to fall back to classic HTML
+// messages on error — old-client rendering of rich messages is
+// undocumented and server-side validation is stricter than parse_mode.
+export async function sendRichMarkdownMessage(
+  chatId: number,
+  markdown: string,
+  opts: { replyToMessageId?: number; inlineKeyboard?: InlineKeyboard } = {},
+): Promise<{ message_id: number }> {
+  return await rawTelegramMethod("sendRichMessage", {
+    chat_id: chatId,
+    rich_message: { markdown },
+    ...(opts.replyToMessageId !== undefined
+      ? {
+          reply_parameters: {
+            message_id: opts.replyToMessageId,
+            allow_sending_without_reply: true,
+          },
+        }
+      : {}),
+    ...(opts.inlineKeyboard
+      ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+      : {}),
+  });
+}
+
+// Edits an existing (plain or rich) bot message into a rich message.
+// editMessageText accepts rich_message as an alternative to text.
+export async function editIntoRichMarkdownMessage(
+  chatId: number,
+  messageId: number,
+  markdown: string,
+  opts: { inlineKeyboard?: InlineKeyboard } = {},
+): Promise<void> {
+  try {
+    await rawTelegramMethod("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      rich_message: { markdown },
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/message is not modified/i.test(msg)) throw err;
+  }
+}
+
+// Escapes text that goes into rich markdown as plain prose (transcripts).
+// Rich markdown may contain arbitrary HTML, so raw < / & could be parsed
+// as tags — and it's GFM, so spoken "*", "_", "#" etc. would otherwise
+// turn into formatting. GFM honors backslash escapes.
+export function escapeRichText(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/([*_`[\]~|])/g, "\\$1")
+    .replace(/^([#>+\-=])/gm, "\\$1");
+}
+
+// Converts our summary-markdown conventions into Rich Markdown. The `> `
+// quote blocks that classic rendering turns into expandable blockquotes
+// become collapsed <details> blocks here — same "expand for the long
+// version" affordance, native to rich messages.
+export function summaryMarkdownToRichMarkdown(
+  md: string,
+  detailsLabel = "Подробнее",
+): string {
+  const out: string[] = [];
+  let quote: string[] | null = null;
+  const flushQuote = () => {
+    if (quote !== null) {
+      out.push(
+        `<details><summary>${detailsLabel}</summary>`,
+        "",
+        ...quote,
+        "",
+        "</details>",
+      );
+      quote = null;
+    }
+  };
+  for (const line of md.split("\n")) {
+    const m = line.match(/^\s*>\s?(.*)$/);
+    if (m) {
+      (quote ??= []).push(m[1]);
+    } else {
+      flushQuote();
+      out.push(line);
+    }
+  }
+  flushQuote();
+  return out.join("\n");
+}
+
+// Markdown-level counterpart of resolveMessageLinks: rewrites
+// `[text](msg:12345)` targets into t.me deep links before the markdown is
+// handed to sendRichMessage.
+export function resolveMessageLinksMarkdown(
+  md: string,
+  chatId: number,
+): string {
+  const channelId = String(chatId).replace(/^-100/, "");
+  return md.replace(
+    /\]\(msg:(\d+)\)/g,
+    (_m, msgId: string) => `](https://t.me/c/${channelId}/${msgId})`,
+  );
+}
+
 // Looks up our own bot username via getMe so we can build deep-link URLs
 // like t.me/<username>?start=… for group reply buttons.
 export async function getMe(): Promise<{
@@ -239,6 +508,119 @@ export function splitTextSafely(
   }
   if (rest.length > 0) chunks.push(rest);
   return chunks;
+}
+
+// Post-processing pass for splitHtmlSafely: makes every chunk
+// independently well-formed HTML. A cut point chosen by splitTextSafely
+// can land inside an inline tag pair (<b>, <i>, <a href>…), inside a tag
+// itself, or inside an entity — any of which is a hard 400 from Telegram.
+// Partial tags/entities at a cut are moved to the next chunk; tags left
+// open at a chunk boundary are closed at its end and reopened (with their
+// original attributes) at the start of the next chunk.
+function repairHtmlChunks(chunks: string[]): string[] {
+  const out: string[] = [];
+  let carry: Array<{ name: string; open: string }> = [];
+  let partial = "";
+  for (const raw of chunks) {
+    let chunk = partial + raw;
+    partial = "";
+    // Tag cut mid-way: a `<` after the last `>`.
+    const lastLt = chunk.lastIndexOf("<");
+    if (lastLt > chunk.lastIndexOf(">")) {
+      partial = chunk.slice(lastLt);
+      chunk = chunk.slice(0, lastLt);
+    }
+    // Entity cut mid-way: a short trailing `&…` run without its `;`.
+    const entity = chunk.match(/&[a-zA-Z0-9#]{0,9}$/);
+    if (entity) {
+      partial = entity[0] + partial;
+      chunk = chunk.slice(0, chunk.length - entity[0].length);
+    }
+    const prefix = carry.map((t) => t.open).join("");
+    const stack = carry.slice();
+    const tagRe = /<(\/?)([a-zA-Z][\w-]*)((?:\s[^<>]*)?)>/g;
+    let m: RegExpExecArray | null;
+    while ((m = tagRe.exec(chunk)) !== null) {
+      const name = m[2].toLowerCase();
+      if (m[1] !== "/") {
+        stack.push({ name, open: m[0] });
+      } else {
+        for (let i = stack.length - 1; i >= 0; i--) {
+          if (stack[i].name === name) {
+            stack.splice(i, 1);
+            break;
+          }
+        }
+      }
+    }
+    const suffix = stack
+      .slice()
+      .reverse()
+      .map((t) => `</${t.name}>`)
+      .join("");
+    out.push(prefix + chunk + suffix);
+    carry = stack;
+  }
+  return out.filter((c) => c.trim().length > 0);
+}
+
+// Splits already-rendered Telegram HTML into chunks that fit the limit
+// WITHOUT tearing <blockquote> tags apart (a torn tag is a hard 400 from
+// the API). Text between quotes splits on the usual soft boundaries; a
+// quote that fits goes into a chunk whole; an oversized quote is split by
+// content and each part gets its own open/close tags. A final repair pass
+// closes/reopens inline tags cut at chunk boundaries, so every emitted
+// chunk is well-formed on its own.
+export function splitHtmlSafely(
+  html: string,
+  maxLen: number = TG_TEXT_LIMIT,
+): string[] {
+  if (html.length <= maxLen) return [html];
+  const OPEN = "<blockquote expandable>";
+  const CLOSE = "</blockquote>";
+
+  type Unit = { kind: "text" | "quote"; content: string };
+  const units: Unit[] = [];
+  const re = /<blockquote(?:\s+expandable)?>([\s\S]*?)<\/blockquote>/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    if (m.index > last)
+      units.push({ kind: "text", content: html.slice(last, m.index) });
+    units.push({ kind: "quote", content: m[1] });
+    last = m.index + m[0].length;
+  }
+  if (last < html.length)
+    units.push({ kind: "text", content: html.slice(last) });
+
+  const chunks: string[] = [];
+  let cur = "";
+  const append = (piece: string) => {
+    if (piece.length === 0) return;
+    if (cur.length + piece.length <= maxLen) {
+      cur += piece;
+      return;
+    }
+    if (cur.trim().length > 0) chunks.push(cur.trimEnd());
+    cur = piece.replace(/^\n+/, "");
+  };
+  for (const unit of units) {
+    if (unit.kind === "text") {
+      for (const part of splitTextSafely(unit.content, maxLen)) append(part);
+    } else {
+      const wrapped = `${OPEN}${unit.content}${CLOSE}`;
+      if (wrapped.length <= maxLen) {
+        append(wrapped);
+      } else {
+        const budget = maxLen - OPEN.length - CLOSE.length;
+        for (const part of splitTextSafely(unit.content, budget)) {
+          append(`${OPEN}${part}${CLOSE}`);
+        }
+      }
+    }
+  }
+  if (cur.trim().length > 0) chunks.push(cur.trimEnd());
+  return repairHtmlChunks(chunks.length > 0 ? chunks : [html.slice(0, maxLen)]);
 }
 
 // Custom emoji used as a loading spinner in status messages. Rendered via
@@ -331,6 +713,31 @@ export function markdownToTelegramHtml(text: string): string {
   // 3e. Headings: # … ###### become bold.
   s = s.replace(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/gm, "<b>$1</b>");
 
+  // 3f. Blockquotes: runs of consecutive `> `-prefixed lines (escaped to
+  // `&gt;` by step 2) collapse into a single expandable blockquote. This
+  // is how summary prompts mark "details the reader expands on demand".
+  {
+    const out: string[] = [];
+    let quote: string[] | null = null;
+    const flushQuote = () => {
+      if (quote !== null) {
+        out.push(`<blockquote expandable>${quote.join("\n")}</blockquote>`);
+        quote = null;
+      }
+    };
+    for (const line of s.split("\n")) {
+      const m = line.match(/^\s*&gt;\s?(.*)$/);
+      if (m) {
+        (quote ??= []).push(m[1]);
+      } else {
+        flushQuote();
+        out.push(line);
+      }
+    }
+    flushQuote();
+    s = out.join("\n");
+  }
+
   // 4. Restore stashed code spans.
   s = s.replace(
     /\u0000SLOT(\d+)\u0000/g,
@@ -398,6 +805,9 @@ export async function setWebhook(opts: {
       "edited_business_message",
       "guest_message",
       "callback_query",
+      // Quiet mode: reaction on a voice → ephemeral summary. Telegram
+      // only delivers these when the bot is a chat admin.
+      "message_reaction",
     ] as any,
     drop_pending_updates: false,
   });

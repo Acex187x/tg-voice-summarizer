@@ -42,6 +42,21 @@ export const get = internalQuery({
   },
 });
 
+// Finds the voice whose summary lives in the given bot message (the ack
+// message that got edited into the final summary). Used by reply-to-summary
+// Q&A.
+export const findByAckMessage = internalQuery({
+  args: { chatId: v.number(), ackMessageId: v.number() },
+  handler: async (ctx, { chatId, ackMessageId }) => {
+    return await ctx.db
+      .query("voiceMessages")
+      .withIndex("by_chat_ack", (q) =>
+        q.eq("chatId", chatId).eq("ackMessageId", ackMessageId),
+      )
+      .first();
+  },
+});
+
 export const getByShortId = internalQuery({
   args: { shortId: v.string() },
   handler: async (ctx, { shortId }) => {
@@ -98,9 +113,26 @@ export const setStatus = internalMutation({
 });
 
 export const setTranscript = internalMutation({
-  args: { id: v.id("voiceMessages"), transcript: v.string() },
-  handler: async (ctx, { id, transcript }) => {
-    await ctx.db.patch(id, { transcript });
+  args: {
+    id: v.id("voiceMessages"),
+    transcript: v.string(),
+    segments: v.optional(
+      v.array(
+        v.object({
+          start: v.number(),
+          end: v.number(),
+          text: v.string(),
+        }),
+      ),
+    ),
+  },
+  handler: async (ctx, { id, transcript, segments }) => {
+    await ctx.db.patch(id, {
+      transcript,
+      ...(segments && segments.length > 0
+        ? { transcriptSegments: segments }
+        : {}),
+    });
   },
 });
 

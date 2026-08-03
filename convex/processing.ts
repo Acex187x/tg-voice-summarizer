@@ -7,23 +7,33 @@ import {
   CLASSIFY_PROVIDER,
   SUMMARIZE_MODEL,
   SUMMARIZE_PROVIDER,
+  summarizeModelId,
   TRANSCRIBE_MODEL,
 } from "./models";
-import { chatComplete, chatCompleteStream, transcribeAudio } from "./openai";
+import {
+  chatComplete,
+  chatCompleteStream,
+  transcribeAudioWithTimestamps,
+} from "./openai";
 import {
   buildChatSummaryPrompt,
   buildFilterAgentSystemPrompt,
   buildShortVoiceCleanTextPrompt,
   buildSummaryPrompt,
+  buildSummaryQaPrompt,
   type ContextKey,
   type Detail,
   type FilterDecision,
+  formatTimecode,
+  formatTimestampedTranscript,
+  LONG_VOICE_SECTIONS_MIN_SEC,
   MEMORY_REFRESH_SYSTEM_PROMPT,
   type ModeKey,
   parseFilterResponse,
   parseRouterResponse,
   parseVoiceNonsenseResponse,
   ROUTER_SYSTEM_PROMPT,
+  type TimedSegment,
   VOICE_NONSENSE_SYSTEM_PROMPT,
 } from "./prompts";
 import {
@@ -35,8 +45,16 @@ import {
   loadingEmoji,
   markdownToTelegramHtml,
   resolveMessageLinks,
+  editIntoRichMarkdownMessage,
+  escapeRichText,
+  resolveMessageLinksMarkdown,
+  RICH_TEXT_LIMIT,
+  sendChatAction,
   sendMessage,
-  splitTextSafely,
+  sendRichMarkdownMessage,
+  setMessageReaction,
+  splitHtmlSafely,
+  summaryMarkdownToRichMarkdown,
   TG_TEXT_LIMIT,
   type InlineKeyboard,
 } from "./telegram";
@@ -164,16 +182,14 @@ export const processVoiceMessage = internalAction({
       const tStart = Date.now();
       const filePath = await getFilePath(record.fileId);
       const blob = await downloadFile(filePath);
-      const transcript = await transcribeAudio(
-        blob,
-        TRANSCRIBE_MODEL,
-        "voice.ogg",
-      );
+      const { text: transcript, segments } =
+        await transcribeAudioWithTimestamps(blob, TRANSCRIBE_MODEL, "voice.ogg");
       timings.transcribeMs = Date.now() - tStart;
       if (!transcript) throw new Error("Whisper returned empty transcript");
       await ctx.runMutation(internal.voiceMessages.setTranscript, {
         id,
         transcript,
+        segments,
       });
       const linkedChatMessage = await ctx.runQuery(
         internal.chatMessages.findByMessage,
@@ -202,6 +218,7 @@ export const processVoiceMessage = internalAction({
         id,
         transcript,
         chatSettings,
+        record.durationSec,
       );
       timings.routerMs = resolved.routerMs;
       const nonsense = await nonsensePromise;
@@ -238,11 +255,14 @@ export const processVoiceMessage = internalAction({
       const lore = await loadChatLore(ctx, record.chatId);
       const summaryText = await generateAndCacheSummary(ctx, id, {
         transcript,
+        segments,
+        durationSec: record.durationSec,
         mode: resolved.mode,
         context: resolved.context,
         detail: resolved.detail,
         chatStyleNotes: memory?.notes ?? null,
         chatLore: lore,
+        modelId: summarizeModelId(chatSettings.summarizeModelKey),
       });
       if (await isVoiceCancelled(ctx, id)) return;
       timings.summarizeMs = Date.now() - sStart;
@@ -259,6 +279,18 @@ export const processVoiceMessage = internalAction({
         detail: resolved.detail,
       });
 
+      // Quiet mode: nothing is posted publicly. The summary sits in the
+      // cache; a reaction on the voice serves it ephemerally (bot.ts →
+      // handleMessageReaction). The 👀 reaction signals "ready".
+      if (chatSettings.quietMode && !isBusinessPrivateResult) {
+        await ctx.runMutation(internal.voiceMessages.setStatus, {
+          id,
+          status: "done",
+        });
+        await setMessageReaction(record.chatId, record.messageId, "👀");
+        return;
+      }
+
       // ---- 4. Commit the final chat message ---------------------------
       const fresh = await ctx.runQuery(internal.voiceMessages.get, { id });
       const botUsername = await ctx.runQuery(
@@ -268,6 +300,7 @@ export const processVoiceMessage = internalAction({
       const rendered = renderFinal({
         summary: summaryText,
         transcript,
+        segments,
         mode: resolved.mode,
         context: resolved.context,
         detail: resolved.detail,
@@ -338,6 +371,7 @@ export async function resolveVoiceSettings(
   voiceId: Id<"voiceMessages">,
   transcript: string,
   settings: { mode: ModeKey; context: ContextKey; detail: Detail },
+  durationSec?: number,
 ): Promise<ResolvedSettings> {
   let mode: ModeKey = settings.mode;
   let context: ContextKey = settings.context;
@@ -358,6 +392,23 @@ export async function resolveVoiceSettings(
       detail: settings.detail,
       routerMs: 0,
     };
+  }
+
+  // Long voices default to the sectioned per-topic summary. Only kicks in
+  // for "auto" — an explicit mode choice always wins. The forced value is
+  // stored as the auto resolution so the DM picker shows "Авто → Темы"
+  // consistently with what the chat message displays.
+  const forceSections =
+    mode === "auto" && (durationSec ?? 0) >= LONG_VOICE_SECTIONS_MIN_SEC;
+  if (forceSections) {
+    mode = "sections";
+    if (context !== "auto") {
+      await ctx.runMutation(internal.voiceMessages.setAutoResolution, {
+        id: voiceId,
+        autoMode: "sections",
+        autoContext: context,
+      });
+    }
   }
 
   // Fast path: nothing to resolve.
@@ -406,7 +457,9 @@ export async function resolveVoiceSettings(
 
   await ctx.runMutation(internal.voiceMessages.setAutoResolution, {
     id: voiceId,
-    autoMode: routed.mode,
+    // When sections mode was duration-forced, that's what "auto" resolves
+    // to for this voice — not whatever the router would have picked.
+    autoMode: forceSections ? "sections" : routed.mode,
     autoContext: routed.context,
   });
 
@@ -425,11 +478,18 @@ export async function resolveVoiceSettings(
 
 export interface GenerateArgs {
   transcript: string;
+  // Whisper segment timestamps for this voice, when available. Used to
+  // feed the sections mode a timestamped transcript so it can anchor
+  // topics to real timecodes.
+  segments?: TimedSegment[] | null;
+  durationSec?: number | null;
   mode: Exclude<ModeKey, "auto">;
   context: Exclude<ContextKey, "auto">;
   detail: Detail;
   chatStyleNotes?: string | null;
   chatLore?: string | null;
+  // Per-chat summarizer model id (from /modal). Defaults to SUMMARIZE_MODEL.
+  modelId?: string | null;
 }
 
 // Looks up the (voice, mode, context, detail) key in the summaries cache.
@@ -489,11 +549,22 @@ async function generateAndCacheSummary(
         args.chatStyleNotes ?? null,
         args.chatLore ?? null,
       );
+  // The sections mode needs timestamps to anchor topics to; other modes
+  // get the plain transcript (timestamps would only burn tokens there).
+  const useTimestamps =
+    args.mode === "sections" && (args.segments?.length ?? 0) > 0;
+  const transcriptBlock = useTimestamps
+    ? formatTimestampedTranscript(args.segments!)
+    : args.transcript;
+  const durationLine =
+    useTimestamps && args.durationSec
+      ? `Длительность аудио: ${formatTimecode(args.durationSec)}\n`
+      : "";
   const completionArgs = {
     provider: SUMMARIZE_PROVIDER,
-    model: SUMMARIZE_MODEL,
+    model: args.modelId ?? SUMMARIZE_MODEL,
     system,
-    user: `Расшифровка:\n"""\n${args.transcript}\n"""`,
+    user: `${durationLine}Расшифровка:\n"""\n${transcriptBlock}\n"""`,
     temperature: useShortCleanup ? 0.2 : 0.4,
   };
   const text = onPartial
@@ -520,6 +591,9 @@ async function generateAndCacheSummary(
 interface RenderArgs {
   summary: string;
   transcript: string;
+  // Whisper segments — when present, the rich-message transcript is
+  // rendered with [M:SS] anchors.
+  segments?: TimedSegment[] | null;
   mode: Exclude<ModeKey, "auto">;
   context: Exclude<ContextKey, "auto">;
   detail: Detail;
@@ -537,6 +611,11 @@ interface RenderArgs {
 export interface RenderedMessage {
   summaryHtml: string;
   quoteHtml: string;
+  // Rich-message (Bot API 10.1+) markdown variant of the same content.
+  // commitFinal uses it when preferRich is set or the classic rendering
+  // overflows a single message; on API error it falls back to classic.
+  richMarkdown?: string;
+  preferRich?: boolean;
 }
 
 export function renderFinal(args: RenderArgs): RenderedMessage {
@@ -565,7 +644,60 @@ export function renderFinal(args: RenderArgs): RenderedMessage {
   return {
     summaryHtml,
     quoteHtml: quoteLines.join("\n"),
+    richMarkdown: buildVoiceRichMarkdown(args),
+    // Sectioned summaries carry the most structure (headings + per-topic
+    // collapsible details), so they get the rich rendering by default;
+    // other modes only upgrade to rich when they overflow.
+    preferRich: args.mode === "sections",
   };
+}
+
+// Assembles the rich-markdown variant: summary (with `> ` blocks turned
+// into collapsed <details>), optional debug block, and the full transcript
+// in its own collapsed <details> — rich messages fit 32k chars, so even a
+// 40-minute transcript usually rides along instead of hiding behind the
+// "открой в боте" link.
+function buildVoiceRichMarkdown(args: RenderArgs): string | undefined {
+  const parts: string[] = [
+    summaryMarkdownToRichMarkdown(args.summary),
+  ];
+  if (args.debug) {
+    const modeLabel = args.wasAutoMode ? `auto → ${args.mode}` : args.mode;
+    const ctxLabel = args.wasAutoContext
+      ? `auto → ${args.context}`
+      : args.context;
+    parts.push(
+      [
+        `<details><summary>Debug</summary>`,
+        "",
+        `**Стиль:** ${modeLabel}`,
+        `**Контекст:** ${ctxLabel}`,
+        `**Детальность:** ${args.detail}`,
+        `**Модели:** transcribe=openai/${TRANSCRIBE_MODEL}, router=${CLASSIFY_PROVIDER}/${CLASSIFY_MODEL}, summary=${SUMMARIZE_PROVIDER}/${SUMMARIZE_MODEL}`,
+        `**Время:** ${formatTimings(args.timings)}`,
+        "",
+        `</details>`,
+      ].join("\n"),
+    );
+  }
+  let rich = parts.join("\n\n");
+  if (rich.length > RICH_TEXT_LIMIT) return undefined;
+
+  const transcriptText =
+    args.segments && args.segments.length > 0
+      ? formatTimestampedTranscript(args.segments)
+      : args.transcript;
+  const transcriptBlock = [
+    `<details><summary>Расшифровка</summary>`,
+    "",
+    escapeRichText(transcriptText),
+    "",
+    `</details>`,
+  ].join("\n");
+  if (rich.length + transcriptBlock.length + 2 <= RICH_TEXT_LIMIT) {
+    rich += `\n\n${transcriptBlock}`;
+  }
+  return rich;
 }
 
 function formatTimings(t: {
@@ -593,7 +725,9 @@ export function buildOpenInBotKeyboard(
       url: `https://t.me/${botUsername}?start=v${shortId}`,
     });
   }
-  row.push({ text: "❌ Удалить", callback_data: `dv:${shortId}` });
+  // Ephemeral style picker for the voice author — no DM round-trip.
+  row.push({ text: "⚙️ Стиль", callback_data: `gs:${shortId}` });
+  row.push({ text: "❌", callback_data: `dv:${shortId}` });
   return [row];
 }
 
@@ -612,6 +746,8 @@ export interface CommitArgs {
   replyTo?: number;
   summaryHtml: string;
   quoteHtml: string;
+  richMarkdown?: string;
+  preferRich?: boolean;
   keyboard?: InlineKeyboard;
 }
 
@@ -624,6 +760,37 @@ export async function commitFinal(args: CommitArgs): Promise<void> {
   const inlineCombined = args.quoteHtml
     ? `${args.summaryHtml}\n\n${wrapQuote(args.quoteHtml)}`
     : args.summaryHtml;
+
+  // Rich-message path (Bot API 10.1+): used when the renderer asked for it
+  // (sectioned summaries) or when the classic rendering wouldn't fit one
+  // message anyway. Any API error falls through to the classic path —
+  // rich messages are new enough that we don't bet the whole send on them.
+  if (
+    args.richMarkdown &&
+    (args.preferRich || inlineCombined.length > TG_TEXT_LIMIT)
+  ) {
+    try {
+      if (args.ackId !== undefined) {
+        await editIntoRichMarkdownMessage(
+          args.chatId,
+          args.ackId,
+          args.richMarkdown,
+          { inlineKeyboard: args.keyboard },
+        );
+      } else {
+        await sendRichMarkdownMessage(args.chatId, args.richMarkdown, {
+          replyToMessageId: args.replyTo,
+          inlineKeyboard: args.keyboard,
+        });
+      }
+      return;
+    } catch (err) {
+      console.warn(
+        "Rich message commit failed, falling back to classic HTML",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
 
   if (inlineCombined.length <= TG_TEXT_LIMIT) {
     await sendOrEdit(args.chatId, args.ackId, args.replyTo, inlineCombined, {
@@ -640,7 +807,7 @@ export async function commitFinal(args: CommitArgs): Promise<void> {
     return;
   }
 
-  const summaryChunks = splitTextSafely(args.summaryHtml, TG_TEXT_LIMIT);
+  const summaryChunks = splitHtmlSafely(args.summaryHtml, TG_TEXT_LIMIT);
   const lastIdx = summaryChunks.length - 1;
   const lastWithPrompt = `${summaryChunks[lastIdx]}\n\n${LINK_PROMPT_HTML}`;
   if (lastWithPrompt.length <= TG_TEXT_LIMIT) {
@@ -829,6 +996,7 @@ export const processChatSummary = internalAction({
           detail: resolved.detail,
           chatStyleNotes: memory?.notes ?? null,
           chatLore: lore,
+          modelId: summarizeModelId(chatSettings.summarizeModelKey),
         },
       );
       if (!summaryText)
@@ -1419,6 +1587,7 @@ interface GenerateChatSummaryArgs {
   detail: Detail;
   chatStyleNotes?: string | null;
   chatLore?: string | null;
+  modelId?: string | null;
 }
 
 export async function getOrGenerateChatSummary(
@@ -1451,7 +1620,7 @@ async function generateAndCacheChatSummary(
   );
   const text = await chatComplete({
     provider: SUMMARIZE_PROVIDER,
-    model: SUMMARIZE_MODEL,
+    model: args.modelId ?? SUMMARIZE_MODEL,
     system,
     user: `Лог переписки:\n"""\n${args.chatLog}\n"""`,
     temperature: 0.4,
@@ -1513,11 +1682,50 @@ export function renderChatSummaryFinal(
     body += `\n\n<blockquote expandable>${debugLines.join("\n")}</blockquote>`;
   }
 
+  // Rich variant: same content, but the summary lives in a collapsed
+  // <details> block and can use the full 32k budget instead of being
+  // split across messages. Only used by commitFinal when the classic
+  // rendering overflows a single message.
+  const richSummary = summaryMarkdownToRichMarkdown(
+    resolveMessageLinksMarkdown(args.summaryText, args.chatId),
+  );
+  const richParts = [
+    `**Summary переписки** · ${args.filterDescription} · ${args.messageCount} сообщений`,
+    [
+      `<details><summary>Пересказ</summary>`,
+      "",
+      richSummary,
+      "",
+      `</details>`,
+    ].join("\n"),
+  ];
+  if (args.debug) {
+    const modeLabel = args.wasAutoMode ? `auto → ${args.mode}` : args.mode;
+    const ctxLabel = args.wasAutoContext
+      ? `auto → ${args.context}`
+      : args.context;
+    richParts.push(
+      [
+        `<details><summary>Debug</summary>`,
+        "",
+        `**Стиль:** ${modeLabel}`,
+        `**Контекст:** ${ctxLabel}`,
+        `**Детальность:** ${args.detail}`,
+        `**Модели:** router=${CLASSIFY_PROVIDER}/${CLASSIFY_MODEL}, summary=${SUMMARIZE_PROVIDER}/${SUMMARIZE_MODEL}`,
+        "",
+        `</details>`,
+      ].join("\n"),
+    );
+  }
+  const richMarkdown = richParts.join("\n\n");
+
   // Everything is in summaryHtml; quoteHtml is empty so commitFinal
   // doesn't wrap another blockquote around nothing.
   return {
     summaryHtml: body,
     quoteHtml: "",
+    richMarkdown:
+      richMarkdown.length <= RICH_TEXT_LIMIT ? richMarkdown : undefined,
   };
 }
 
@@ -1562,6 +1770,129 @@ export async function buildChatLogFor(
     .sort((a, b) => a.ts - b.ts);
   const built = await buildChatLog(ctx, filtered);
   return built.log;
+}
+
+// =====================================================================
+// ================ Reply-to-summary Q&A (bot.ts hook) =================
+// =====================================================================
+
+export interface QaArgs {
+  chatId: number;
+  question: string;
+  questionMessageId: number;
+  voice?: Doc<"voiceMessages"> | null;
+  chatSummary?: Doc<"chatSummaries"> | null;
+  // Text of the bot's previous Q&A answer the user replied to (follow-up
+  // questions), if any.
+  quotedAnswer?: string | null;
+}
+
+// Answers a question asked as a reply to a summary message. The prompt
+// carries both the displayed summary and the full source (transcript or
+// chat log) plus the chat's style/lore, so the bot clarifies in character.
+export async function answerSummaryQuestion(
+  ctx: { runQuery: any; runMutation: any },
+  args: QaArgs,
+): Promise<void> {
+  const { chatId } = args;
+  await sendChatAction(chatId, "typing");
+
+  const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  });
+  const memory = await ctx.runQuery(internal.chatMemory.get, { chatId });
+  const lore = await loadChatLore(ctx, chatId);
+
+  let sourceKind: "voice" | "chatSummary";
+  let summaryText = "";
+  let sourceText = "";
+  if (args.voice) {
+    sourceKind = "voice";
+    const voice = args.voice;
+    if (
+      voice.displayedMode &&
+      voice.displayedContext &&
+      voice.displayedDetail !== undefined
+    ) {
+      const cached = await ctx.runQuery(internal.summaries.findCached, {
+        voiceMessageId: voice._id,
+        mode: voice.displayedMode,
+        context: voice.displayedContext,
+        detail: voice.displayedDetail,
+      });
+      summaryText = cached?.text ?? "";
+    }
+    sourceText =
+      voice.transcriptSegments && voice.transcriptSegments.length > 0
+        ? formatTimestampedTranscript(voice.transcriptSegments)
+        : (voice.transcript ?? "");
+  } else if (args.chatSummary) {
+    sourceKind = "chatSummary";
+    const summary = args.chatSummary;
+    if (
+      summary.displayedMode &&
+      summary.displayedContext &&
+      summary.displayedDetail !== undefined
+    ) {
+      const cached = await ctx.runQuery(internal.chatSummaryTexts.findCached, {
+        chatSummaryId: summary._id,
+        mode: summary.displayedMode,
+        context: summary.displayedContext,
+        detail: summary.displayedDetail,
+      });
+      summaryText = cached?.text ?? "";
+    }
+    sourceText = await buildChatLogFor(ctx, summary);
+  } else {
+    return;
+  }
+  if (!sourceText && !summaryText) return;
+
+  const system = buildSummaryQaPrompt(
+    sourceKind,
+    memory?.notes ?? null,
+    lore,
+  );
+  const userParts: string[] = [];
+  if (summaryText) userParts.push(`Summary:\n"""\n${summaryText}\n"""`);
+  if (sourceText) {
+    userParts.push(
+      `${sourceKind === "voice" ? "Полная расшифровка" : "Лог переписки"}:\n"""\n${sourceText}\n"""`,
+    );
+  }
+  if (args.quotedAnswer) {
+    userParts.push(
+      `Твой предыдущий ответ, на который реплаит пользователь:\n"""\n${args.quotedAnswer}\n"""`,
+    );
+  }
+  userParts.push(`Сообщение пользователя:\n"""\n${args.question}\n"""`);
+
+  const text = await chatComplete({
+    provider: SUMMARIZE_PROVIDER,
+    model: summarizeModelId(settings.summarizeModelKey),
+    system,
+    user: userParts.join("\n\n"),
+    temperature: 0.5,
+  });
+  if (!text) return;
+
+  const html = markdownToTelegramHtml(text);
+  const chunks = splitHtmlSafely(html, TG_TEXT_LIMIT);
+  let replyTo = args.questionMessageId;
+  for (const chunk of chunks) {
+    const sent = await sendMessage(chatId, chunk, {
+      parseMode: "HTML",
+      replyToMessageId: replyTo,
+    });
+    replyTo = sent.message_id;
+    // Register the answer so replies to it continue the thread.
+    await ctx.runMutation(internal.qaMessages.create, {
+      chatId,
+      messageId: sent.message_id,
+      voiceShortId: args.voice?.shortId,
+      chatSummaryShortId: args.chatSummary?.shortId,
+    });
+  }
 }
 
 // =====================================================================

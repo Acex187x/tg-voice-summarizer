@@ -32,6 +32,20 @@ export const getByShortId = internalQuery({
   },
 });
 
+// Finds the chat summary whose result lives in the given bot message.
+// Used by reply-to-summary Q&A.
+export const findByAckMessage = internalQuery({
+  args: { chatId: v.number(), ackMessageId: v.number() },
+  handler: async (ctx, { chatId, ackMessageId }) => {
+    return await ctx.db
+      .query("chatSummaries")
+      .withIndex("by_chat_ack", (q) =>
+        q.eq("chatId", chatId).eq("ackMessageId", ackMessageId),
+      )
+      .first();
+  },
+});
+
 // Creates the chat-summary request row. Selection (messageIds, ts range,
 // username) is set later by patchSelection once the filter has run.
 export const create = internalMutation({

@@ -35,16 +35,50 @@ function getOpenRouterKey(): string {
 }
 
 // ---- Transcription (OpenAI only) ------------------------------------------
+
+// One timed block of transcript. Times are in seconds from the start of
+// the audio. Produced from Whisper's verbose_json segments.
+export interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+export interface TranscriptionResult {
+  text: string;
+  // Present when the model returned segment timestamps (whisper-1 with
+  // verbose_json). Empty for models that can't produce them.
+  segments: TranscriptSegment[];
+}
+
 export async function transcribeAudio(
   audio: Blob,
   model: string,
   filename = "voice.ogg",
 ): Promise<string> {
+  const { text } = await transcribeAudioWithTimestamps(audio, model, filename);
+  return text;
+}
+
+// Transcribes and returns segment-level timestamps alongside the plain
+// text. verbose_json is only supported by whisper-1 — for other models we
+// transparently fall back to a plain text transcription with no segments.
+export async function transcribeAudioWithTimestamps(
+  audio: Blob,
+  model: string,
+  filename = "voice.ogg",
+): Promise<TranscriptionResult> {
   const key = getOpenAIKey();
+  const wantTimestamps = model.startsWith("whisper");
   const form = new FormData();
   form.append("file", audio, filename);
   form.append("model", model);
-  form.append("response_format", "text");
+  if (wantTimestamps) {
+    form.append("response_format", "verbose_json");
+    form.append("timestamp_granularities[]", "segment");
+  } else {
+    form.append("response_format", "text");
+  }
 
   const res = await fetch(`${OPENAI_BASE}/audio/transcriptions`, {
     method: "POST",
@@ -57,7 +91,32 @@ export async function transcribeAudio(
       `Transcription failed (model=${model}): ${res.status} ${errText}`,
     );
   }
-  return (await res.text()).trim();
+  if (!wantTimestamps) {
+    return { text: (await res.text()).trim(), segments: [] };
+  }
+  const json = (await res.json()) as {
+    text?: string;
+    segments?: Array<{ start?: number; end?: number; text?: string }>;
+  };
+  const segments: TranscriptSegment[] = (json.segments ?? [])
+    .filter(
+      (s) =>
+        typeof s.start === "number" &&
+        typeof s.end === "number" &&
+        typeof s.text === "string" &&
+        s.text.trim().length > 0,
+    )
+    .map((s) => {
+      const start = Math.max(0, s.start!);
+      return {
+        start,
+        // end < start would give negative block durations downstream and
+        // break timestamp-block flushing; clamp defensively.
+        end: Math.max(start, s.end!),
+        text: s.text!.trim(),
+      };
+    });
+  return { text: (json.text ?? "").trim(), segments };
 }
 
 // ---- Chat completion (OpenAI or OpenRouter) -------------------------------

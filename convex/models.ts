@@ -28,10 +28,30 @@ export const CLASSIFY_PROVIDER: LlmProvider = "openrouter";
 export const CLASSIFY_MODEL = "x-ai/grok-4.3";
 
 // ---- Stage 3: summarizer ----
-// Currently set to whatever you had via /setmodel before this refactor
-// (google/gemini-3.1-flash-lite-preview). Edit freely.
+// The summarizer is switchable per chat via the /modal command in the
+// group. The catalog below is the full set of options; the per-chat pick
+// is stored in chatSettings.summarizeModel (by KEY, so a model id bump
+// here upgrades every chat automatically).
 export const SUMMARIZE_PROVIDER: LlmProvider = "openrouter";
-export const SUMMARIZE_MODEL = "google/gemini-3-flash-preview";
+
+export const SUMMARIZE_MODEL_OPTIONS = {
+  gemini: { id: "google/gemini-3.6-flash", label: "Gemini 3.6 Flash" },
+  grok: { id: "x-ai/grok-4.5", label: "Grok 4.5" },
+} as const;
+export type SummarizeModelKey = keyof typeof SUMMARIZE_MODEL_OPTIONS;
+export const DEFAULT_SUMMARIZE_MODEL_KEY: SummarizeModelKey = "gemini";
+
+export function isSummarizeModelKey(s: string): s is SummarizeModelKey {
+  return s in SUMMARIZE_MODEL_OPTIONS;
+}
+export function summarizeModelId(key: SummarizeModelKey): string {
+  return SUMMARIZE_MODEL_OPTIONS[key].id;
+}
+
+// Default model id — used when a chat has no explicit pick and by legacy
+// call sites that don't thread a per-chat model through.
+export const SUMMARIZE_MODEL =
+  SUMMARIZE_MODEL_OPTIONS[DEFAULT_SUMMARIZE_MODEL_KEY].id;
 
 // ---- Stage 4: embeddings (semantic search) ----
 // OpenAI only. Convex vector indexes need a fixed dimensionality in schema.
