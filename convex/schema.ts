@@ -93,7 +93,10 @@ export default defineSchema({
   })
     .index("by_chat_message", ["chatId", "messageId"])
     .index("by_status", ["status"])
-    .index("by_short_id", ["shortId"]),
+    .index("by_short_id", ["shortId"])
+    // Lookup by the bot's summary message in the source chat — used by
+    // the reply-to-summary Q&A flow.
+    .index("by_chat_ack", ["chatId", "ackMessageId"]),
 
   businessConnections: defineTable({
     connectionId: v.string(),
@@ -129,6 +132,14 @@ export default defineSchema({
     defaultMode: v.string(),
     defaultContext: v.string(),
     defaultDetail: v.number(),
+    // Summarizer model KEY from models.SUMMARIZE_MODEL_OPTIONS ("gemini" /
+    // "grok"), toggled via /modal. Absent → default key.
+    summarizeModel: v.optional(v.string()),
+    // Quiet mode (/quiet): the bot doesn't post summaries publicly;
+    // instead a reaction on a voice message gets the reactor an ephemeral
+    // summary. Requires the bot to be a chat admin (both for reaction
+    // updates and for at-will ephemeral sends).
+    quietMode: v.optional(v.boolean()),
   }).index("by_chat", ["chatId"]),
 
   // Per-chat nickname overrides. When set, the bot uses this name instead
@@ -360,7 +371,9 @@ export default defineSchema({
     ),
     error: v.optional(v.string()),
     cancelled: v.optional(v.boolean()),
-  }).index("by_short_id", ["shortId"]),
+  })
+    .index("by_short_id", ["shortId"])
+    .index("by_chat_ack", ["chatId", "ackMessageId"]),
 
   // Cache for chat-summary text by (request, mode, context, detail). Same
   // pattern as voice `summaries`, just keyed against chatSummaries.
@@ -389,6 +402,16 @@ export default defineSchema({
     ),
     updatedAt: v.number(),
   }).index("by_user_summary", ["userId", "chatSummaryShortId"]),
+
+  // The bot's own Q&A answer messages (replies to questions asked under a
+  // summary). Stored so a follow-up reply to the bot's answer keeps the
+  // link back to the source voice / chat summary.
+  qaMessages: defineTable({
+    chatId: v.number(),
+    messageId: v.number(), // the bot's answer message id in the chat
+    voiceShortId: v.optional(v.string()),
+    chatSummaryShortId: v.optional(v.string()),
+  }).index("by_chat_message", ["chatId", "messageId"]),
 
   // ---- end of chat-summary feature ---------------------------------------
 

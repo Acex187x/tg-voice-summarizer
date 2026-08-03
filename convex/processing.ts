@@ -7,6 +7,7 @@ import {
   CLASSIFY_PROVIDER,
   SUMMARIZE_MODEL,
   SUMMARIZE_PROVIDER,
+  summarizeModelId,
   TRANSCRIBE_MODEL,
 } from "./models";
 import {
@@ -19,6 +20,7 @@ import {
   buildFilterAgentSystemPrompt,
   buildShortVoiceCleanTextPrompt,
   buildSummaryPrompt,
+  buildSummaryQaPrompt,
   type ContextKey,
   type Detail,
   type FilterDecision,
@@ -47,8 +49,10 @@ import {
   escapeRichText,
   resolveMessageLinksMarkdown,
   RICH_TEXT_LIMIT,
+  sendChatAction,
   sendMessage,
   sendRichMarkdownMessage,
+  setMessageReaction,
   splitHtmlSafely,
   summaryMarkdownToRichMarkdown,
   TG_TEXT_LIMIT,
@@ -258,6 +262,7 @@ export const processVoiceMessage = internalAction({
         detail: resolved.detail,
         chatStyleNotes: memory?.notes ?? null,
         chatLore: lore,
+        modelId: summarizeModelId(chatSettings.summarizeModelKey),
       });
       if (await isVoiceCancelled(ctx, id)) return;
       timings.summarizeMs = Date.now() - sStart;
@@ -273,6 +278,18 @@ export const processVoiceMessage = internalAction({
         context: resolved.context,
         detail: resolved.detail,
       });
+
+      // Quiet mode: nothing is posted publicly. The summary sits in the
+      // cache; a reaction on the voice serves it ephemerally (bot.ts →
+      // handleMessageReaction). The 👀 reaction signals "ready".
+      if (chatSettings.quietMode && !isBusinessPrivateResult) {
+        await ctx.runMutation(internal.voiceMessages.setStatus, {
+          id,
+          status: "done",
+        });
+        await setMessageReaction(record.chatId, record.messageId, "👀");
+        return;
+      }
 
       // ---- 4. Commit the final chat message ---------------------------
       const fresh = await ctx.runQuery(internal.voiceMessages.get, { id });
@@ -471,6 +488,8 @@ export interface GenerateArgs {
   detail: Detail;
   chatStyleNotes?: string | null;
   chatLore?: string | null;
+  // Per-chat summarizer model id (from /modal). Defaults to SUMMARIZE_MODEL.
+  modelId?: string | null;
 }
 
 // Looks up the (voice, mode, context, detail) key in the summaries cache.
@@ -543,7 +562,7 @@ async function generateAndCacheSummary(
       : "";
   const completionArgs = {
     provider: SUMMARIZE_PROVIDER,
-    model: SUMMARIZE_MODEL,
+    model: args.modelId ?? SUMMARIZE_MODEL,
     system,
     user: `${durationLine}Расшифровка:\n"""\n${transcriptBlock}\n"""`,
     temperature: useShortCleanup ? 0.2 : 0.4,
@@ -706,7 +725,9 @@ export function buildOpenInBotKeyboard(
       url: `https://t.me/${botUsername}?start=v${shortId}`,
     });
   }
-  row.push({ text: "❌ Удалить", callback_data: `dv:${shortId}` });
+  // Ephemeral style picker for the voice author — no DM round-trip.
+  row.push({ text: "⚙️ Стиль", callback_data: `gs:${shortId}` });
+  row.push({ text: "❌", callback_data: `dv:${shortId}` });
   return [row];
 }
 
@@ -975,6 +996,7 @@ export const processChatSummary = internalAction({
           detail: resolved.detail,
           chatStyleNotes: memory?.notes ?? null,
           chatLore: lore,
+          modelId: summarizeModelId(chatSettings.summarizeModelKey),
         },
       );
       if (!summaryText)
@@ -1565,6 +1587,7 @@ interface GenerateChatSummaryArgs {
   detail: Detail;
   chatStyleNotes?: string | null;
   chatLore?: string | null;
+  modelId?: string | null;
 }
 
 export async function getOrGenerateChatSummary(
@@ -1597,7 +1620,7 @@ async function generateAndCacheChatSummary(
   );
   const text = await chatComplete({
     provider: SUMMARIZE_PROVIDER,
-    model: SUMMARIZE_MODEL,
+    model: args.modelId ?? SUMMARIZE_MODEL,
     system,
     user: `Лог переписки:\n"""\n${args.chatLog}\n"""`,
     temperature: 0.4,
@@ -1729,6 +1752,129 @@ export async function buildChatLogFor(
     .sort((a, b) => a.ts - b.ts);
   const built = await buildChatLog(ctx, filtered);
   return built.log;
+}
+
+// =====================================================================
+// ================ Reply-to-summary Q&A (bot.ts hook) =================
+// =====================================================================
+
+export interface QaArgs {
+  chatId: number;
+  question: string;
+  questionMessageId: number;
+  voice?: Doc<"voiceMessages"> | null;
+  chatSummary?: Doc<"chatSummaries"> | null;
+  // Text of the bot's previous Q&A answer the user replied to (follow-up
+  // questions), if any.
+  quotedAnswer?: string | null;
+}
+
+// Answers a question asked as a reply to a summary message. The prompt
+// carries both the displayed summary and the full source (transcript or
+// chat log) plus the chat's style/lore, so the bot clarifies in character.
+export async function answerSummaryQuestion(
+  ctx: { runQuery: any; runMutation: any },
+  args: QaArgs,
+): Promise<void> {
+  const { chatId } = args;
+  await sendChatAction(chatId, "typing");
+
+  const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  });
+  const memory = await ctx.runQuery(internal.chatMemory.get, { chatId });
+  const lore = await loadChatLore(ctx, chatId);
+
+  let sourceKind: "voice" | "chatSummary";
+  let summaryText = "";
+  let sourceText = "";
+  if (args.voice) {
+    sourceKind = "voice";
+    const voice = args.voice;
+    if (
+      voice.displayedMode &&
+      voice.displayedContext &&
+      voice.displayedDetail !== undefined
+    ) {
+      const cached = await ctx.runQuery(internal.summaries.findCached, {
+        voiceMessageId: voice._id,
+        mode: voice.displayedMode,
+        context: voice.displayedContext,
+        detail: voice.displayedDetail,
+      });
+      summaryText = cached?.text ?? "";
+    }
+    sourceText =
+      voice.transcriptSegments && voice.transcriptSegments.length > 0
+        ? formatTimestampedTranscript(voice.transcriptSegments)
+        : (voice.transcript ?? "");
+  } else if (args.chatSummary) {
+    sourceKind = "chatSummary";
+    const summary = args.chatSummary;
+    if (
+      summary.displayedMode &&
+      summary.displayedContext &&
+      summary.displayedDetail !== undefined
+    ) {
+      const cached = await ctx.runQuery(internal.chatSummaryTexts.findCached, {
+        chatSummaryId: summary._id,
+        mode: summary.displayedMode,
+        context: summary.displayedContext,
+        detail: summary.displayedDetail,
+      });
+      summaryText = cached?.text ?? "";
+    }
+    sourceText = await buildChatLogFor(ctx, summary);
+  } else {
+    return;
+  }
+  if (!sourceText && !summaryText) return;
+
+  const system = buildSummaryQaPrompt(
+    sourceKind,
+    memory?.notes ?? null,
+    lore,
+  );
+  const userParts: string[] = [];
+  if (summaryText) userParts.push(`Summary:\n"""\n${summaryText}\n"""`);
+  if (sourceText) {
+    userParts.push(
+      `${sourceKind === "voice" ? "Полная расшифровка" : "Лог переписки"}:\n"""\n${sourceText}\n"""`,
+    );
+  }
+  if (args.quotedAnswer) {
+    userParts.push(
+      `Твой предыдущий ответ, на который реплаит пользователь:\n"""\n${args.quotedAnswer}\n"""`,
+    );
+  }
+  userParts.push(`Сообщение пользователя:\n"""\n${args.question}\n"""`);
+
+  const text = await chatComplete({
+    provider: SUMMARIZE_PROVIDER,
+    model: summarizeModelId(settings.summarizeModelKey),
+    system,
+    user: userParts.join("\n\n"),
+    temperature: 0.5,
+  });
+  if (!text) return;
+
+  const html = markdownToTelegramHtml(text);
+  const chunks = splitHtmlSafely(html, TG_TEXT_LIMIT);
+  let replyTo = args.questionMessageId;
+  for (const chunk of chunks) {
+    const sent = await sendMessage(chatId, chunk, {
+      parseMode: "HTML",
+      replyToMessageId: replyTo,
+    });
+    replyTo = sent.message_id;
+    // Register the answer so replies to it continue the thread.
+    await ctx.runMutation(internal.qaMessages.create, {
+      chatId,
+      messageId: sent.message_id,
+      voiceShortId: args.voice?.shortId,
+      chatSummaryShortId: args.chatSummary?.shortId,
+    });
+  }
 }
 
 // =====================================================================

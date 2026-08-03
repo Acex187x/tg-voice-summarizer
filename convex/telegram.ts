@@ -202,6 +202,157 @@ export async function editGuestMessageText(
   }
 }
 
+// ---- Reactions (Bot API 7.0+) ---------------------------------------------
+
+// Sets (or clears, with no emoji) the bot's reaction on a message. Bots
+// get one reaction from the fixed emoji set. Used in quiet mode to signal
+// "processed — react to get the summary".
+export async function setMessageReaction(
+  chatId: number,
+  messageId: number,
+  emoji?: string,
+): Promise<void> {
+  try {
+    await rawTelegramMethod("setMessageReaction", {
+      chat_id: chatId,
+      message_id: messageId,
+      reaction: emoji ? [{ type: "emoji", emoji }] : [],
+    });
+  } catch (err) {
+    console.warn(
+      "setMessageReaction failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+// ---- Ephemeral messages (Bot API 10.2) ------------------------------------
+
+// Sends a message visible only to `receiverUserId` in a group chat.
+// Conditions (per Bot API docs):
+//   • any bot — within 15s of a callback query (pass callbackQueryId) or
+//     of an incoming ephemeral message (pass replyToEphemeralMessageId);
+//   • admin bot — to any non-bot member at any time, no trigger needed.
+// Ephemeral messages have message_id 0; the real handle is
+// ephemeral_message_id. Returns null on failure so callers can fall back
+// to a regular send.
+export async function sendEphemeralMessage(
+  chatId: number,
+  receiverUserId: number,
+  text: string,
+  opts: {
+    callbackQueryId?: string;
+    replyToEphemeralMessageId?: number;
+    parseMode?: ParseMode;
+    inlineKeyboard?: InlineKeyboard;
+  } = {},
+): Promise<{ ephemeral_message_id?: number } | null> {
+  try {
+    const result = await rawTelegramMethod<{
+      message_id: number;
+      ephemeral_message_id?: number;
+    }>("sendMessage", {
+      chat_id: chatId,
+      receiver_user_id: receiverUserId,
+      text,
+      link_preview_options: { is_disabled: true },
+      ...(opts.callbackQueryId
+        ? { callback_query_id: opts.callbackQueryId }
+        : {}),
+      ...(opts.replyToEphemeralMessageId !== undefined
+        ? {
+            reply_parameters: {
+              ephemeral_message_id: opts.replyToEphemeralMessageId,
+            },
+          }
+        : {}),
+      ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+    return { ephemeral_message_id: result.ephemeral_message_id };
+  } catch (err) {
+    console.warn(
+      "sendEphemeralMessage failed",
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
+}
+
+export async function editEphemeralMessageText(
+  chatId: number,
+  receiverUserId: number,
+  ephemeralMessageId: number,
+  text: string,
+  opts: { parseMode?: ParseMode; inlineKeyboard?: InlineKeyboard } = {},
+): Promise<boolean> {
+  try {
+    await rawTelegramMethod("editEphemeralMessageText", {
+      chat_id: chatId,
+      receiver_user_id: receiverUserId,
+      ephemeral_message_id: ephemeralMessageId,
+      text,
+      link_preview_options: { is_disabled: true },
+      ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+      ...(opts.inlineKeyboard
+        ? { reply_markup: buildReplyMarkup(opts.inlineKeyboard)! }
+        : {}),
+    });
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/message is not modified/i.test(msg)) return true;
+    console.warn("editEphemeralMessageText failed", msg);
+    return false;
+  }
+}
+
+export async function deleteEphemeralMessage(
+  chatId: number,
+  receiverUserId: number,
+  ephemeralMessageId: number,
+): Promise<void> {
+  try {
+    await rawTelegramMethod("deleteEphemeralMessage", {
+      chat_id: chatId,
+      receiver_user_id: receiverUserId,
+      ephemeral_message_id: ephemeralMessageId,
+    });
+  } catch (err) {
+    console.warn(
+      "deleteEphemeralMessage failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+// Registers the bot's command list. Commands marked ephemeral are
+// invisible in the chat when sent (Bot API 10.2 BotCommand.is_ephemeral)
+// and let the bot answer ephemerally without being an admin.
+export async function setMyCommands(
+  commands: Array<{
+    command: string;
+    description: string;
+    is_ephemeral?: boolean;
+  }>,
+): Promise<void> {
+  await rawTelegramMethod("setMyCommands", { commands });
+}
+
+// "typing…" indicator while the Q&A model thinks.
+export async function sendChatAction(
+  chatId: number,
+  action = "typing",
+): Promise<void> {
+  try {
+    await rawTelegramMethod("sendChatAction", { chat_id: chatId, action });
+  } catch {
+    // cosmetic, ignore
+  }
+}
+
 // ---- Rich messages (Bot API 10.1+) ----------------------------------------
 
 // Rich messages allow up to 32768 UTF-8 chars; leave headroom the same way
@@ -594,6 +745,9 @@ export async function setWebhook(opts: {
       "edited_business_message",
       "guest_message",
       "callback_query",
+      // Quiet mode: reaction on a voice → ephemeral summary. Telegram
+      // only delivers these when the bot is a chat admin.
+      "message_reaction",
     ] as any,
     drop_pending_updates: false,
   });

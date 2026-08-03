@@ -1,6 +1,6 @@
 import { internal } from "./_generated/api";
 import { internalAction } from "./_generated/server";
-import { getMe, setWebhook } from "./telegram";
+import { getMe, setMyCommands, setWebhook } from "./telegram";
 
 // Idempotent webhook registration. Computes the webhook URL from
 // CONVEX_SITE_URL (set automatically by Convex), generates a stable secret
@@ -37,6 +37,28 @@ export const registerWebhook = internalAction({
       webhookUrl,
       webhookSecret: secret,
     });
+
+    // Command list. /modal and /quiet are ephemeral (Bot API 10.2): the
+    // command message itself is invisible in the chat and the bot can
+    // answer ephemerally without admin rights.
+    try {
+      await setMyCommands([
+        { command: "summary", description: "Summary переписки за период" },
+        { command: "search", description: "Поиск по истории чата" },
+        {
+          command: "modal",
+          description: "Выбрать модель суммаризации",
+          is_ephemeral: true,
+        },
+        {
+          command: "quiet",
+          description: "Тихий режим вкл/выкл",
+          is_ephemeral: true,
+        },
+      ]);
+    } catch (err) {
+      console.warn("setMyCommands failed during registerWebhook", err);
+    }
 
     // Always re-fetch the bot username — it's cheap and self-heals if it
     // changes (e.g. admin renames the bot at @BotFather).

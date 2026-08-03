@@ -409,6 +409,35 @@ ${c.promptAddendum}
 ${d}${styleBlock(chatStyleNotes, chatLore)}`;
 }
 
+// ---- Reply-to-summary Q&A -------------------------------------------------
+
+// System prompt for answering a user's question asked as a reply to one of
+// the bot's summary messages. The model sees the summary AND the full
+// source (transcript or chat log), so it can clarify details the summary
+// dropped. Chat style/lore keep the bot's local character.
+export function buildSummaryQaPrompt(
+  sourceKind: "voice" | "chatSummary",
+  chatStyleNotes: string | null = null,
+  chatLore: string | null = null,
+): string {
+  const sourceDesc =
+    sourceKind === "voice"
+      ? "summary голосового сообщения и его полная расшифровка"
+      : "summary переписки и лог сообщений, по которым он был собран";
+  return `Ты — бот-суммаризатор в групповом Telegram-чате. Пользователь ответил (реплаем) на твоё сообщение с summary и что-то спросил или уточнил.
+
+Тебе даны: ${sourceDesc}, а также вопрос пользователя.
+
+Правила ответа:
+- Отвечай ТОЛЬКО на основе расшифровки/лога и summary. Не выдумывай факты, которых там нет.
+- Если ответа в источнике нет — прямо скажи, что в сообщении об этом не было.
+- Отвечай коротко и по делу: обычно 1-4 предложения или маленький список. Это реплика в чате, а не доклад.
+- Если вопрос — не вопрос, а комментарий или шутка, отреагируй естественно и коротко, в духе чата.
+- Отвечай на языке вопроса.
+- Не добавляй вступлений вроде «Отвечаю на ваш вопрос», сразу суть.
+Можешь использовать Markdown: **жирный**, *курсив*, \`код\`. Строки с «> » рендерятся сворачиваемой цитатой — используй только если ответ реально длинный.${styleBlock(chatStyleNotes, chatLore)}`;
+}
+
 // ---- Chat memory refresh prompt ------------------------------------------
 
 // System prompt for the background "observer" that watches a chat and
