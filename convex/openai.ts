@@ -106,11 +106,16 @@ export async function transcribeAudioWithTimestamps(
         typeof s.text === "string" &&
         s.text.trim().length > 0,
     )
-    .map((s) => ({
-      start: Math.max(0, s.start!),
-      end: Math.max(0, s.end!),
-      text: s.text!.trim(),
-    }));
+    .map((s) => {
+      const start = Math.max(0, s.start!);
+      return {
+        start,
+        // end < start would give negative block durations downstream and
+        // break timestamp-block flushing; clamp defensively.
+        end: Math.max(start, s.end!),
+        text: s.text!.trim(),
+      };
+    });
   return { text: (json.text ?? "").trim(), segments };
 }
 

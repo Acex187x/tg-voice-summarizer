@@ -1699,6 +1699,24 @@ export function renderChatSummaryFinal(
       `</details>`,
     ].join("\n"),
   ];
+  if (args.debug) {
+    const modeLabel = args.wasAutoMode ? `auto → ${args.mode}` : args.mode;
+    const ctxLabel = args.wasAutoContext
+      ? `auto → ${args.context}`
+      : args.context;
+    richParts.push(
+      [
+        `<details><summary>Debug</summary>`,
+        "",
+        `**Стиль:** ${modeLabel}`,
+        `**Контекст:** ${ctxLabel}`,
+        `**Детальность:** ${args.detail}`,
+        `**Модели:** router=${CLASSIFY_PROVIDER}/${CLASSIFY_MODEL}, summary=${SUMMARIZE_PROVIDER}/${SUMMARIZE_MODEL}`,
+        "",
+        `</details>`,
+      ].join("\n"),
+    );
+  }
   const richMarkdown = richParts.join("\n\n");
 
   // Everything is in summaryHtml; quoteHtml is empty so commitFinal

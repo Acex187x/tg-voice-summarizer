@@ -411,10 +411,15 @@ export async function editIntoRichMarkdownMessage(
 }
 
 // Escapes text that goes into rich markdown as plain prose (transcripts).
-// Rich markdown may contain arbitrary HTML, so raw < / & in a transcript
-// could be parsed as tags.
+// Rich markdown may contain arbitrary HTML, so raw < / & could be parsed
+// as tags — and it's GFM, so spoken "*", "_", "#" etc. would otherwise
+// turn into formatting. GFM honors backslash escapes.
 export function escapeRichText(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/([*_`[\]~|])/g, "\\$1")
+    .replace(/^([#>+\-=])/gm, "\\$1");
 }
 
 // Converts our summary-markdown conventions into Rich Markdown. The `> `
@@ -505,11 +510,66 @@ export function splitTextSafely(
   return chunks;
 }
 
+// Post-processing pass for splitHtmlSafely: makes every chunk
+// independently well-formed HTML. A cut point chosen by splitTextSafely
+// can land inside an inline tag pair (<b>, <i>, <a href>…), inside a tag
+// itself, or inside an entity — any of which is a hard 400 from Telegram.
+// Partial tags/entities at a cut are moved to the next chunk; tags left
+// open at a chunk boundary are closed at its end and reopened (with their
+// original attributes) at the start of the next chunk.
+function repairHtmlChunks(chunks: string[]): string[] {
+  const out: string[] = [];
+  let carry: Array<{ name: string; open: string }> = [];
+  let partial = "";
+  for (const raw of chunks) {
+    let chunk = partial + raw;
+    partial = "";
+    // Tag cut mid-way: a `<` after the last `>`.
+    const lastLt = chunk.lastIndexOf("<");
+    if (lastLt > chunk.lastIndexOf(">")) {
+      partial = chunk.slice(lastLt);
+      chunk = chunk.slice(0, lastLt);
+    }
+    // Entity cut mid-way: a short trailing `&…` run without its `;`.
+    const entity = chunk.match(/&[a-zA-Z0-9#]{0,9}$/);
+    if (entity) {
+      partial = entity[0] + partial;
+      chunk = chunk.slice(0, chunk.length - entity[0].length);
+    }
+    const prefix = carry.map((t) => t.open).join("");
+    const stack = carry.slice();
+    const tagRe = /<(\/?)([a-zA-Z][\w-]*)((?:\s[^<>]*)?)>/g;
+    let m: RegExpExecArray | null;
+    while ((m = tagRe.exec(chunk)) !== null) {
+      const name = m[2].toLowerCase();
+      if (m[1] !== "/") {
+        stack.push({ name, open: m[0] });
+      } else {
+        for (let i = stack.length - 1; i >= 0; i--) {
+          if (stack[i].name === name) {
+            stack.splice(i, 1);
+            break;
+          }
+        }
+      }
+    }
+    const suffix = stack
+      .slice()
+      .reverse()
+      .map((t) => `</${t.name}>`)
+      .join("");
+    out.push(prefix + chunk + suffix);
+    carry = stack;
+  }
+  return out.filter((c) => c.trim().length > 0);
+}
+
 // Splits already-rendered Telegram HTML into chunks that fit the limit
 // WITHOUT tearing <blockquote> tags apart (a torn tag is a hard 400 from
 // the API). Text between quotes splits on the usual soft boundaries; a
 // quote that fits goes into a chunk whole; an oversized quote is split by
-// content and each part gets its own open/close tags, so every emitted
+// content and each part gets its own open/close tags. A final repair pass
+// closes/reopens inline tags cut at chunk boundaries, so every emitted
 // chunk is well-formed on its own.
 export function splitHtmlSafely(
   html: string,
@@ -560,7 +620,7 @@ export function splitHtmlSafely(
     }
   }
   if (cur.trim().length > 0) chunks.push(cur.trimEnd());
-  return chunks.length > 0 ? chunks : [html.slice(0, maxLen)];
+  return repairHtmlChunks(chunks.length > 0 ? chunks : [html.slice(0, maxLen)]);
 }
 
 // Custom emoji used as a loading spinner in status messages. Rendered via
