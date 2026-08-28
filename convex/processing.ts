@@ -352,7 +352,11 @@ export const processVoiceMessage = internalAction({
         timings,
         debug: debugMode,
       });
-      const keyboard = buildOpenInBotKeyboard(botUsername, fresh?.shortId);
+      const keyboard = buildOpenInBotKeyboard(botUsername, fresh?.shortId, {
+        businessSend:
+          record.businessConnectionId !== undefined &&
+          record.businessOutgoing === true,
+      });
       await commitFinal({
         chatId: responseChatId,
         ackId,
@@ -408,11 +412,37 @@ export const processVoiceMessage = internalAction({
   },
 });
 
-// ---- Business auto-send ---------------------------------------------------
+// ---- Business transcript sends --------------------------------------------
 
-// Posts the transcript of the owner's outgoing voice into the managed
-// conversation when that conversation's autoSendTranscript toggle is on.
-// Soft-fails: a revoked connection or missing permissions must not kill
+// Posts a transcript into the managed conversation on behalf of the
+// owner's account, as a reply to the voice. Long transcripts go out as an
+// HTML-safe chunk chain. Shared by the auto-send toggle and the manual
+// "Отправить собеседнику" button. Throws on API failure — callers decide
+// whether that's fatal.
+export async function sendBusinessTranscript(
+  connectionId: string,
+  chatId: number,
+  voiceMessageId: number,
+  transcript: string,
+): Promise<void> {
+  const header = "🎙 <i>Расшифровка голосового:</i>\n";
+  const quoted = `${header}<blockquote expandable>${escapeHtml(transcript)}</blockquote>`;
+  const chunks =
+    quoted.length <= TG_TEXT_LIMIT
+      ? [quoted]
+      : splitHtmlSafely(quoted, TG_TEXT_LIMIT);
+  let replyTo: number | undefined = voiceMessageId;
+  for (const chunk of chunks) {
+    const sent = await sendBusinessMessage(connectionId, chatId, chunk, {
+      replyToMessageId: replyTo,
+      parseMode: "HTML",
+    });
+    replyTo = sent.message_id;
+  }
+}
+
+// Auto-send variant: only fires when the conversation's toggle is on, and
+// soft-fails — a revoked connection or missing permissions must not kill
 // the rest of the pipeline (the owner still gets their DM summary).
 async function maybeAutoSendBusinessTranscript(
   ctx: { runQuery: any },
@@ -425,22 +455,12 @@ async function maybeAutoSendBusinessTranscript(
       peerChatId: record.chatId,
     });
     if (convSettings?.autoSendTranscript !== true) return;
-    const header = "🎙 <i>Расшифровка голосового:</i>\n";
-    const quoted = `${header}<blockquote expandable>${escapeHtml(transcript)}</blockquote>`;
-    const chunks =
-      quoted.length <= TG_TEXT_LIMIT
-        ? [quoted]
-        : splitHtmlSafely(quoted, TG_TEXT_LIMIT);
-    let replyTo: number | undefined = record.messageId;
-    for (const chunk of chunks) {
-      const sent = await sendBusinessMessage(
-        record.businessConnectionId!,
-        record.chatId,
-        chunk,
-        { replyToMessageId: replyTo, parseMode: "HTML" },
-      );
-      replyTo = sent.message_id;
-    }
+    await sendBusinessTranscript(
+      record.businessConnectionId!,
+      record.chatId,
+      record.messageId,
+      transcript,
+    );
   } catch (err) {
     console.warn(
       "business transcript auto-send failed",
@@ -811,6 +831,13 @@ function formatTimings(t: {
 export function buildOpenInBotKeyboard(
   botUsername: string | undefined | null,
   shortId: string | undefined | null,
+  opts: {
+    // Business outgoing voice: offer the one-tap "send transcript to the
+    // peer" button on the owner's DM summary. `sent` renders it as an
+    // inert confirmation after a successful manual send.
+    businessSend?: boolean;
+    businessSent?: boolean;
+  } = {},
 ): InlineKeyboard | undefined {
   if (!shortId) return undefined;
   const row: InlineKeyboard[number] = [];
@@ -823,7 +850,19 @@ export function buildOpenInBotKeyboard(
   // Ephemeral style picker for the voice author — no DM round-trip.
   row.push({ text: "⚙️ Стиль", callback_data: `gs:${shortId}` });
   row.push({ text: "❌", callback_data: `dv:${shortId}` });
-  return [row];
+  const rows: InlineKeyboard = [row];
+  if (opts.businessSend) {
+    rows.unshift([
+      opts.businessSent
+        ? { text: "✓ Отправлено собеседнику", style: "success", disabled: {} }
+        : {
+            text: "📤 Отправить собеседнику",
+            style: "primary",
+            callback_data: `bx:${shortId}`,
+          },
+    ]);
+  }
+  return rows;
 }
 
 // ---- Long-message handling -------------------------------------------------

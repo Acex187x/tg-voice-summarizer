@@ -64,6 +64,13 @@ export type InlineKeyboard = InlineButton[][];
 
 interface SendOpts {
   replyToMessageId?: number;
+  // External reply (Bot API 7.0): reply to a message living in ANOTHER
+  // chat — the sent message gets a tappable quote header linking there.
+  // Only meaningful together with replyToMessageId. Unlike same-chat
+  // replies there is no allow_sending_without_reply escape hatch, so the
+  // send FAILS if the target can't be referenced — callers must catch and
+  // fall back to a plain send.
+  replyToChatId?: number;
   parseMode?: ParseMode;
   inlineKeyboard?: InlineKeyboard;
 }
@@ -86,7 +93,11 @@ export async function sendMessage(
       ? {
           reply_parameters: {
             message_id: opts.replyToMessageId,
-            allow_sending_without_reply: true,
+            ...(opts.replyToChatId !== undefined
+              ? // Cross-chat reply: allow_sending_without_reply is always
+                // False for these per the API, so don't send it.
+                { chat_id: opts.replyToChatId }
+              : { allow_sending_without_reply: true }),
           },
         }
       : {}),

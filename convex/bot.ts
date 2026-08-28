@@ -22,6 +22,7 @@ import {
   renderChatSummaryFinal,
   renderFinal,
   resolveVoiceSettings,
+  sendBusinessTranscript,
 } from "./processing";
 import {
   ALL_CONTEXT_KEYS,
@@ -1032,16 +1033,31 @@ async function handleVoice(
         : media.kind === "audio"
           ? "Обрабатываю аудио…"
           : "Обрабатываю голосовое…";
+    const ackText = `${loadingEmoji()}  <i>${escapeHtml(label)}</i>`;
     try {
-      const ack = await sendMessage(
-        ackChatId,
-        `${loadingEmoji()}  <i>${escapeHtml(label)}</i>`,
-        {
-          replyToMessageId: opts.privateResult ? undefined : message.message_id,
+      if (opts.privateResult) {
+        // Business voices: the placeholder lands in the OWNER's DM, but as
+        // an EXTERNAL reply to the voice in the managed conversation — the
+        // quote header is a one-tap jump into that dialog. Cross-chat
+        // replies can't fall back automatically, so retry plain on error.
+        let ack: { message_id: number };
+        try {
+          ack = await sendMessage(ackChatId, ackText, {
+            replyToChatId: message.chat.id,
+            replyToMessageId: message.message_id,
+            parseMode: "HTML",
+          });
+        } catch {
+          ack = await sendMessage(ackChatId, ackText, { parseMode: "HTML" });
+        }
+        ackMessageId = ack.message_id;
+      } else {
+        const ack = await sendMessage(ackChatId, ackText, {
+          replyToMessageId: message.message_id,
           parseMode: "HTML",
-        },
-      );
-      ackMessageId = ack.message_id;
+        });
+        ackMessageId = ack.message_id;
+      }
     } catch (err) {
       console.warn("Failed to send ack placeholder", err);
     }
@@ -1961,6 +1977,69 @@ async function handleBusinessToggleCallback(
       parseMode: "HTML",
       inlineKeyboard: panel.keyboard,
     });
+  }
+}
+
+// ---- «Отправить собеседнику»: manual business transcript send -------------
+
+// bx:<shortId> — one tap on the owner's DM summary posts the transcript
+// of their outgoing voice into the managed conversation (sent from the
+// owner's account, as a reply to the voice). On success the button turns
+// into an inert "✓ Отправлено" confirmation.
+async function handleBusinessSendCallback(
+  ctx: { runMutation: any; runQuery: any },
+  cb: TgCallbackQuery,
+  shortId: string,
+): Promise<void> {
+  const voice = (await ctx.runQuery(internal.voiceMessages.getByShortId, {
+    shortId,
+  })) as Doc<"voiceMessages"> | null;
+  if (!voice || !voice.businessConnectionId) {
+    await answerCallbackQuery(cb.id, "Сообщение не найдено");
+    return;
+  }
+  if (cb.from.id !== voice.businessUserChatId) {
+    await answerCallbackQuery(cb.id, "Кнопка только для владельца аккаунта", true);
+    return;
+  }
+  if (!voice.transcript) {
+    await answerCallbackQuery(cb.id, "Расшифровка ещё не готова — подождите");
+    return;
+  }
+  try {
+    await sendBusinessTranscript(
+      voice.businessConnectionId,
+      voice.chatId,
+      voice.messageId,
+      voice.transcript,
+    );
+  } catch (err) {
+    console.warn(
+      "manual business transcript send failed",
+      err instanceof Error ? err.message : String(err),
+    );
+    await answerCallbackQuery(
+      cb.id,
+      "Не удалось отправить — проверьте, что бот всё ещё подключён к аккаунту",
+      true,
+    );
+    return;
+  }
+  await answerCallbackQuery(cb.id, "📤 Отправлено собеседнику");
+  if (cb.message) {
+    const botUsername = await ctx.runQuery(
+      internal.botConfig.getBotUsername,
+      {},
+    );
+    const keyboard = buildOpenInBotKeyboard(botUsername, shortId, {
+      businessSend: true,
+      businessSent: true,
+    });
+    await editMessageReplyMarkup(
+      cb.message.chat.id,
+      cb.message.message_id,
+      keyboard,
+    );
   }
 }
 
@@ -3128,6 +3207,10 @@ async function handleCallback(
       await handleBusinessToggleCallback(ctx, cb, parts);
       return;
     }
+    if (parts[0] === "bx" && parts.length === 2) {
+      await handleBusinessSendCallback(ctx, cb, parts[1]);
+      return;
+    }
     if (parts[0] === "mm") {
       await handleModalCallback(ctx, cb, parts);
       return;
@@ -3583,7 +3666,11 @@ async function regenerateVoiceInChat(
     timings: {},
     debug: debugMode,
   });
-  const keyboard = buildOpenInBotKeyboard(botUsername, voice.shortId);
+  const keyboard = buildOpenInBotKeyboard(botUsername, voice.shortId, {
+    businessSend:
+      voice.businessConnectionId !== undefined &&
+      voice.businessOutgoing === true,
+  });
   // Business voices live in a managed conversation, but the bot's summary
   // message for them is in the OWNER's DM — restyle edits go there.
   const isBusinessResult = voice.businessUserChatId !== undefined;

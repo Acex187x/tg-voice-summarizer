@@ -150,6 +150,13 @@ In the bot's DM `/settings` opens the private-mode panel instead:
   (the peer sees it from the owner's account) as soon as transcription
   finishes. Off by default.
 
+Every business summary in the owner's DM arrives as an **external reply**
+(Bot API cross-chat reply) to the original voice in the managed
+conversation — tapping the quote header jumps straight into that dialog.
+Summaries of the owner's OUTGOING voices additionally carry a one-tap
+**«📤 Отправить собеседнику»** button that posts the transcript into the
+conversation manually, regardless of the auto-send toggle.
+
 Incoming voices from peers are always transcribed into the owner's DM with
 the bot — Telegram has no way to show a transcript inside a private
 conversation that only one side can see (ephemeral messages are
