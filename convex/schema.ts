@@ -184,6 +184,8 @@ export default defineSchema({
     // deliveryMode is absent (quietMode=true → "onDemand"). New code
     // writes deliveryMode.
     quietMode: v.optional(v.boolean()),
+    // Ancient pre-history field still present on some rows; never read.
+    showTranscript: v.optional(v.boolean()),
   }).index("by_chat", ["chatId"]),
 
   // Per-chat nickname overrides. When set, the bot uses this name instead
