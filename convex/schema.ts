@@ -65,6 +65,22 @@ export default defineSchema({
     // message during processing. The pipeline checks this between
     // stages and bails out without further edits/sends.
     cancelled: v.optional(v.boolean()),
+    // Delivery plan resolved at ingest time (chat settings + sender kind):
+    //   "instant"       — placeholder → final summary (classic);
+    //   "instantSilent" — no placeholder, trigger reaction while
+    //                     processing, summary posted as a reply;
+    //   "onDemand"      — nothing public; trigger reaction when the
+    //                     transcript is ready, summary served ephemerally.
+    // A bot-mention reply to the voice upgrades this to "instant"
+    // mid-flight; the pipeline re-reads it before committing. Absent on
+    // legacy rows → derived from chat settings.
+    delivery: v.optional(
+      v.union(
+        v.literal("instant"),
+        v.literal("instantSilent"),
+        v.literal("onDemand"),
+      ),
+    ),
     // The bot's reply message in the source chat. Instantly posted as
     // "Обрабатываю…", then edited with progress and the final summary.
     ackMessageId: v.optional(v.number()),
@@ -135,10 +151,38 @@ export default defineSchema({
     // Summarizer model KEY from models.SUMMARIZE_MODEL_OPTIONS ("gemini" /
     // "grok"), toggled via /modal. Absent → default key.
     summarizeModel: v.optional(v.string()),
-    // Quiet mode (/quiet): the bot doesn't post summaries publicly;
-    // instead a reaction on a voice message gets the reactor an ephemeral
-    // summary. Requires the bot to be a chat admin (both for reaction
-    // updates and for at-will ephemeral sends).
+    // How the bot answers voices from regular members (/settings):
+    //   "instant"  — post a loading placeholder, edit it into the summary
+    //                (classic behavior, the default);
+    //   "onDemand" — post nothing; mark the processed voice with the
+    //                trigger reaction, serve the summary ephemerally to
+    //                whoever reacts with that reaction. Requires the bot
+    //                to be a chat admin.
+    deliveryMode: v.optional(
+      v.union(v.literal("instant"), v.literal("onDemand")),
+    ),
+    // Instant mode only: skip the "Обрабатываю…" placeholder — react with
+    // the trigger reaction on receipt and post the summary when ready.
+    skipLoadingMessage: v.optional(v.boolean()),
+    // Voices posted on behalf of a channel (channel posts auto-forwarded
+    // into the linked discussion group, and messages sent with the channel
+    // identity) are always processed in instant mode with a placeholder,
+    // regardless of deliveryMode. Default true.
+    channelVoicesInstant: v.optional(v.boolean()),
+    // Trigger reaction for on-demand mode ( /reaction ). Either a plain
+    // emoji from Telegram's allowed reaction set or a custom (premium)
+    // emoji id. Absent → 👀.
+    reactionType: v.optional(
+      v.union(v.literal("emoji"), v.literal("custom_emoji")),
+    ),
+    reactionValue: v.optional(v.string()),
+    // Human-readable form of a custom_emoji reaction (the emoji char the
+    // custom emoji is based on) for menus/messages.
+    reactionDisplay: v.optional(v.string()),
+    // === LEGACY ===
+    // Pre-/settings quiet mode flag. Read only as a fallback when
+    // deliveryMode is absent (quietMode=true → "onDemand"). New code
+    // writes deliveryMode.
     quietMode: v.optional(v.boolean()),
   }).index("by_chat", ["chatId"]),
 

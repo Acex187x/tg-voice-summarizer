@@ -191,6 +191,20 @@ export const processVoiceMessage = internalAction({
         transcript,
         segments,
       });
+      // On-demand delivery: the trigger reaction goes up as soon as the
+      // transcript exists — that's the "ready, react to read" signal.
+      // (The summary may still be generating; the reaction handler serves
+      // a cached transcript immediately and generates on demand.)
+      const chatSettingsEarly = await ctx.runQuery(
+        internal.chatSettings.getResolved,
+        { chatId: record.chatId },
+      );
+      if (record.delivery === "onDemand" && !isBusinessPrivateResult) {
+        await setMessageReaction(record.chatId, record.messageId, {
+          type: chatSettingsEarly.reaction.type,
+          value: chatSettingsEarly.reaction.value,
+        });
+      }
       const linkedChatMessage = await ctx.runQuery(
         internal.chatMessages.findByMessage,
         { chatId: record.chatId, messageId: record.messageId },
@@ -208,10 +222,7 @@ export const processVoiceMessage = internalAction({
       const nonsensePromise = classifyVoiceNonsense(transcript);
 
       // ---- 2. Resolve chat settings + router --------------------------
-      const chatSettings = await ctx.runQuery(
-        internal.chatSettings.getResolved,
-        { chatId: record.chatId },
-      );
+      const chatSettings = chatSettingsEarly;
 
       const resolved = await resolveVoiceSettings(
         ctx,
@@ -230,6 +241,12 @@ export const processVoiceMessage = internalAction({
         });
         if (ackId !== undefined) {
           await deleteMessage(responseChatId, ackId);
+        }
+        // Silent-instant: drop the "processing" reaction; nothing will be
+        // posted. (On-demand keeps its reaction — the transcript is still
+        // servable ephemerally.)
+        if (record.delivery === "instantSilent" && !isBusinessPrivateResult) {
+          await setMessageReaction(record.chatId, record.messageId);
         }
         return;
       }
@@ -279,20 +296,28 @@ export const processVoiceMessage = internalAction({
         detail: resolved.detail,
       });
 
-      // Quiet mode: nothing is posted publicly. The summary sits in the
-      // cache; a reaction on the voice serves it ephemerally (bot.ts →
-      // handleMessageReaction). The 👀 reaction signals "ready".
-      if (chatSettings.quietMode && !isBusinessPrivateResult) {
+      // ---- 4. Commit the final chat message ---------------------------
+      // Re-read the row first: a bot-mention reply may have upgraded an
+      // on-demand voice to "instant" while we were summarizing.
+      const fresh = await ctx.runQuery(internal.voiceMessages.get, { id });
+      const effectiveDelivery =
+        fresh?.delivery ??
+        record.delivery ??
+        (chatSettings.deliveryMode === "onDemand" && !isBusinessPrivateResult
+          ? "onDemand"
+          : "instant");
+
+      // On-demand: nothing is posted publicly. The summary sits in the
+      // cache; the trigger reaction (already set after transcription)
+      // invites members to react and get it ephemerally (bot.ts →
+      // handleMessageReaction).
+      if (effectiveDelivery === "onDemand" && !isBusinessPrivateResult) {
         await ctx.runMutation(internal.voiceMessages.setStatus, {
           id,
           status: "done",
         });
-        await setMessageReaction(record.chatId, record.messageId, "👀");
         return;
       }
-
-      // ---- 4. Commit the final chat message ---------------------------
-      const fresh = await ctx.runQuery(internal.voiceMessages.get, { id });
       const botUsername = await ctx.runQuery(
         internal.botConfig.getBotUsername,
         {},
@@ -318,6 +343,12 @@ export const processVoiceMessage = internalAction({
         keyboard,
       });
 
+      // Silent-instant mode used the trigger reaction as its "processing"
+      // indicator — clear it now that the summary is posted.
+      if (effectiveDelivery === "instantSilent" && !isBusinessPrivateResult) {
+        await setMessageReaction(record.chatId, record.messageId);
+      }
+
       await ctx.runMutation(internal.voiceMessages.setStatus, {
         id,
         status: "done",
@@ -337,6 +368,11 @@ export const processVoiceMessage = internalAction({
           ackId,
           `Не удалось обработать сообщение: ${message}`,
         ).catch(() => {});
+      }
+      // Silent-instant used the reaction as its "processing" indicator —
+      // don't leave it hanging on a voice we failed to process.
+      if (record.delivery === "instantSilent") {
+        await setMessageReaction(record.chatId, record.messageId);
       }
       const adminIdRaw = process.env.ADMIN_TELEGRAM_ID;
       if (adminIdRaw) {

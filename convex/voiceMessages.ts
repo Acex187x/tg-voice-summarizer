@@ -80,6 +80,13 @@ export const create = internalMutation({
     ackMessageId: v.optional(v.number()),
     businessConnectionId: v.optional(v.string()),
     businessUserChatId: v.optional(v.number()),
+    delivery: v.optional(
+      v.union(
+        v.literal("instant"),
+        v.literal("instantSilent"),
+        v.literal("onDemand"),
+      ),
+    ),
   },
   handler: async (ctx, args) => {
     return await ctx.db.insert("voiceMessages", {
@@ -87,6 +94,23 @@ export const create = internalMutation({
       shortId: generateShortId(),
       status: "pending",
     });
+  },
+});
+
+// Upgrades the delivery plan mid-flight (bot-mention reply on a voice
+// that's still processing forces a public "instant" post). The pipeline
+// re-reads the row before committing the final message.
+export const setDelivery = internalMutation({
+  args: {
+    id: v.id("voiceMessages"),
+    delivery: v.union(
+      v.literal("instant"),
+      v.literal("instantSilent"),
+      v.literal("onDemand"),
+    ),
+  },
+  handler: async (ctx, { id, delivery }) => {
+    await ctx.db.patch(id, { delivery });
   },
 });
 

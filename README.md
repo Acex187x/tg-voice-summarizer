@@ -81,29 +81,60 @@ To deploy to production instead of the dev deployment:
 npm run setup:prod
 ```
 
-## Admin commands
+## Commands
 
-All commands work in a private chat with the bot. Some also work inside
-groups (in particular `/summarize` as a reply).
+Group commands (any member):
+
+```
+/settings        chat settings panel (ephemeral — visible only to you)
+/reaction <emo>  change the on-demand trigger reaction (plain or premium emoji)
+/summary [args]  summarize a slice of the chat history
+/search, /ask    semantic search / grounded Q&A over the chat history
+/modal           pick the summarizer model (alias for a /settings submenu)
+/quiet           toggle on-demand mode (alias for a /settings switch)
+```
+
+Admin commands (private chat with the bot or groups):
 
 ```
 /start, /help    show help
 /whoami          print your Telegram user ID and the chat ID
-/types           list configured voice-message types (with their IDs)
-/addtype         step-by-step wizard to add a new type
-/edittype <id>   change a single field of an existing type
-/deltype <id>    delete a type
 /summarize       reply to a voice/audio message to (re)summarize it
-/models          show which LLM model each pipeline stage uses
-/setmodel ...    change the model for a stage (see below)
-/resetmodels     reset every stage back to code defaults
-/debug [on|off]  toggle debug mode (adds type/models/timings to the quote)
-/cancel          cancel any in-progress wizard
+/defaults        show/set default summary mode+context+detail for the chat
+/debug [on|off]  toggle debug mode (adds models/timings to the quote)
+/importdump      import a Telegram JSON export into the search index
+/indexstats      DB / vector-index coverage stats
 ```
 
 Unknown commands and plain (non-command) text from the owner are
-intentionally silent — the bot never says "I don't understand". Wizards
-(`/addtype` etc.) only accept input in a private chat with the bot.
+intentionally silent — the bot never says "I don't understand".
+
+### Chat settings (/settings)
+
+The `/settings` panel is sent ephemerally (only the invoker sees it) and
+uses Bot API 9.4/10.3 styled buttons. It controls, per chat:
+
+- **Режим ответа** — `Сразу в чат` (loading placeholder → summary, the
+  classic flow) or `По требованию` (nothing is posted; the bot marks a
+  processed voice with the trigger reaction, and a member putting the same
+  reaction on the voice receives the transcription as an ephemeral message
+  only they can see). On-demand mode needs the bot to be a chat admin and
+  the trigger reaction to be enabled in the chat.
+- **Сообщение о загрузке** — when disabled (instant mode only), the bot
+  skips the placeholder: it puts the trigger reaction on the voice while
+  processing and posts the finished summary directly.
+- **Войсы от имени канала** — channel posts auto-forwarded into the linked
+  discussion chat and voices sent "as the channel" are always processed
+  instantly with a visible placeholder, regardless of the other settings
+  (on by default).
+- **Реакция-триггер** — defaults to 👀; presets in the panel, arbitrary
+  (including premium/custom) emoji via `/reaction`.
+- **Модель / стиль / контекст / детальность** — per-chat summarizer model
+  and default summary settings.
+
+Mentioning the bot in a reply to any voice always posts a public
+transcription of that voice, in every mode; in on-demand mode the bot also
+deletes the mention message to keep the chat clean.
 
 ### How a voice reply looks
 
