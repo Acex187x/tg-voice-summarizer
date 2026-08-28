@@ -136,6 +136,26 @@ Mentioning the bot in a reply to any voice always posts a public
 transcription of that voice, in every mode; in on-demand mode the bot also
 deletes the mention message to keep the chat clean.
 
+### Private mode (/settings in the bot DM)
+
+In the bot's DM `/settings` opens the private-mode panel instead:
+
+- **Summarizer model + default style/context/detail** for the owner's own
+  voices — applies both to voices sent straight to the bot and to voices
+  flowing through Telegram Business conversations.
+- **Business conversations** (when the bot is connected as the account's
+  chat-bot manager): one row per conversation that has had a voice, with a
+  per-conversation **auto-send** toggle — when on, the transcript of a
+  voice the OWNER sends in that conversation is posted right back into it
+  (the peer sees it from the owner's account) as soon as transcription
+  finishes. Off by default.
+
+Incoming voices from peers are always transcribed into the owner's DM with
+the bot — Telegram has no way to show a transcript inside a private
+conversation that only one side can see (ephemeral messages are
+group-only). The style buttons under a DM summary open a regular picker
+message there (ephemeral pickers are likewise group-only).
+
 ### How a voice reply looks
 
 The bot reacts to a voice message in three phases inside a *single* reply
@@ -155,21 +175,14 @@ which model handled each stage, and per-stage timings.
 ### Changing models per stage
 
 The pipeline has three stages, each driven by a separately-configurable
-model:
+model. The transcribe/classify models and the summarizer catalog live in
+code — `convex/models.ts` — and change via redeploy, not via commands:
 
 | Stage | Default | Notes |
 |---|---|---|
 | `transcribe` | `openai / whisper-1` | OpenAI only (OpenRouter has no audio endpoint). |
-| `classify` | `openai / gpt-4o-mini` | JSON-mode classifier that picks one of your types. |
-| `summarize` | `openai / gpt-4o-mini` | Runs your type's summary prompt. |
-
-Change them from inside Telegram:
-
-```
-/setmodel transcribe whisper-1
-/setmodel classify openrouter anthropic/claude-3.5-haiku
-/setmodel summarize openai gpt-4o
-```
+| `classify` | `openrouter / grok` | JSON-mode router + /summary filter agent. |
+| `summarize` | `openrouter / gemini` | Per-chat pick from the catalog via `/settings` → model (or `/modal`). |
 
 Any stage pointed at `openrouter` requires `OPENROUTER_API_KEY` to be set in
 `.env.local` and re-pushed with `npm run setup`.

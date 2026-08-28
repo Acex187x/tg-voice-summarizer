@@ -80,6 +80,7 @@ export const create = internalMutation({
     ackMessageId: v.optional(v.number()),
     businessConnectionId: v.optional(v.string()),
     businessUserChatId: v.optional(v.number()),
+    businessOutgoing: v.optional(v.boolean()),
     delivery: v.optional(
       v.union(
         v.literal("instant"),

@@ -49,6 +49,7 @@ import {
   escapeRichText,
   resolveMessageLinksMarkdown,
   RICH_TEXT_LIMIT,
+  sendBusinessMessage,
   sendChatAction,
   sendMessage,
   sendRichMarkdownMessage,
@@ -195,15 +196,32 @@ export const processVoiceMessage = internalAction({
       // transcript exists — that's the "ready, react to read" signal.
       // (The summary may still be generating; the reaction handler serves
       // a cached transcript immediately and generates on demand.)
+      // Business voices take the OWNER's DM settings (model, default
+      // style) — per-managed-conversation chatSettings rows don't exist.
       const chatSettingsEarly = await ctx.runQuery(
         internal.chatSettings.getResolved,
-        { chatId: record.chatId },
+        { chatId: record.businessUserChatId ?? record.chatId },
       );
-      if (record.delivery === "onDemand" && !isBusinessPrivateResult) {
+      // Legacy rows have no stored delivery plan — fall back to the chat
+      // settings the same way the commit stage does, so an on-demand
+      // legacy voice still gets its trigger reaction.
+      const initialDelivery =
+        record.delivery ??
+        (chatSettingsEarly.deliveryMode === "onDemand" &&
+        !isBusinessPrivateResult
+          ? "onDemand"
+          : "instant");
+      if (initialDelivery === "onDemand" && !isBusinessPrivateResult) {
         await setMessageReaction(record.chatId, record.messageId, {
           type: chatSettingsEarly.reaction.type,
           value: chatSettingsEarly.reaction.value,
         });
+      }
+      // Business mode: the owner's OUTGOING voice in a conversation with
+      // the auto-send toggle on gets its transcript posted right into the
+      // managed chat (the peer sees it as sent from the owner's account).
+      if (record.businessConnectionId && record.businessOutgoing) {
+        await maybeAutoSendBusinessTranscript(ctx, record, transcript);
       }
       const linkedChatMessage = await ctx.runQuery(
         internal.chatMessages.findByMessage,
@@ -389,6 +407,47 @@ export const processVoiceMessage = internalAction({
     }
   },
 });
+
+// ---- Business auto-send ---------------------------------------------------
+
+// Posts the transcript of the owner's outgoing voice into the managed
+// conversation when that conversation's autoSendTranscript toggle is on.
+// Soft-fails: a revoked connection or missing permissions must not kill
+// the rest of the pipeline (the owner still gets their DM summary).
+async function maybeAutoSendBusinessTranscript(
+  ctx: { runQuery: any },
+  record: Doc<"voiceMessages">,
+  transcript: string,
+): Promise<void> {
+  try {
+    const convSettings = await ctx.runQuery(internal.businessChatSettings.get, {
+      connectionId: record.businessConnectionId!,
+      peerChatId: record.chatId,
+    });
+    if (convSettings?.autoSendTranscript !== true) return;
+    const header = "🎙 <i>Расшифровка голосового:</i>\n";
+    const quoted = `${header}<blockquote expandable>${escapeHtml(transcript)}</blockquote>`;
+    const chunks =
+      quoted.length <= TG_TEXT_LIMIT
+        ? [quoted]
+        : splitHtmlSafely(quoted, TG_TEXT_LIMIT);
+    let replyTo: number | undefined = record.messageId;
+    for (const chunk of chunks) {
+      const sent = await sendBusinessMessage(
+        record.businessConnectionId!,
+        record.chatId,
+        chunk,
+        { replyToMessageId: replyTo, parseMode: "HTML" },
+      );
+      replyTo = sent.message_id;
+    }
+  } catch (err) {
+    console.warn(
+      "business transcript auto-send failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
 
 // ---- Router ---------------------------------------------------------------
 

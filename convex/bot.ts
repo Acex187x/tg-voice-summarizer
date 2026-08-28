@@ -74,7 +74,15 @@ type TgUser = {
   last_name?: string;
   username?: string;
 };
-type TgChat = { id: number; type: string; title?: string; username?: string };
+type TgChat = {
+  id: number;
+  type: string;
+  title?: string;
+  username?: string;
+  // Private chats (incl. business-managed conversations).
+  first_name?: string;
+  last_name?: string;
+};
 type TgBusinessConnection = {
   id: string;
   user?: TgUser;
@@ -184,7 +192,7 @@ function getAllowedChatIds(): Set<number> | null {
 
 const HELP_TEXT = `Команды админа:
 
-/settings — настройки бота в чате (режим ответа, реакция, модель, дефолты)
+/settings — настройки бота: в группе — режим ответа/реакция/модель, в личке — бизнес-переписки и дефолты
 /reaction <эмодзи> — сменить реакцию-триггер режима «по требованию»
 /defaults — показать/изменить дефолтные настройки summary для этого чата
 /debug [on|off] — дебаг-режим
@@ -330,12 +338,15 @@ export const handleUpdate = internalAction({
 
     // 3a-bis. Chat-settings commands. All registered as ephemeral commands
     // (invisible in chat); any group member can use them. /modal and
-    // /quiet are legacy aliases for parts of /settings.
-    if (
-      !isPrivateChat &&
-      /^\/settings(?:@[\w_]+)?(?:\s|$)/i.test(commandText)
-    ) {
-      await handleSettingsCommand(ctx, message);
+    // /quiet are legacy aliases for parts of /settings. In the bot's DM
+    // /settings opens the private-mode panel (business conversations +
+    // personal defaults).
+    if (/^\/settings(?:@[\w_]+)?(?:\s|$)/i.test(commandText)) {
+      if (isPrivateChat) {
+        await handleDmSettingsCommand(ctx, message);
+      } else {
+        await handleSettingsCommand(ctx, message);
+      }
       return;
     }
     if (
@@ -498,6 +509,15 @@ async function handleBusinessConnection(
   });
 }
 
+// Human-readable name of the peer in a managed private conversation.
+function businessPeerName(chat: TgChat): string | undefined {
+  return (
+    [chat.first_name, chat.last_name].filter(Boolean).join(" ") ||
+    chat.title ||
+    (chat.username ? `@${chat.username}` : undefined)
+  );
+}
+
 async function handleBusinessMessage(
   ctx: { runMutation: any; runQuery: any; scheduler: any },
   message: TgMessage,
@@ -508,9 +528,24 @@ async function handleBusinessMessage(
     connectionId: message.business_connection_id,
   });
   if (!connection || !connection.isEnabled) return;
+
+  // Direction: the owner's own voices are "outgoing" (they can be
+  // auto-transcribed into the conversation for the peer); everything else
+  // is incoming from the peer.
+  const outgoing = message.from?.id === connection.userId;
+
+  // Materialize/refresh the conversation row so the owner's DM /settings
+  // panel lists it with its toggle.
+  await ctx.runMutation(internal.businessChatSettings.upsertSeen, {
+    connectionId: message.business_connection_id,
+    peerChatId: message.chat.id,
+    peerName: businessPeerName(message.chat),
+  });
+
   await handleVoice(ctx, message, media, {
     businessConnectionId: message.business_connection_id,
     businessUserChatId: connection.userChatId,
+    businessOutgoing: outgoing,
     privateResult: true,
   });
 }
@@ -928,6 +963,7 @@ async function handleVoice(
   opts: {
     businessConnectionId?: string;
     businessUserChatId?: number;
+    businessOutgoing?: boolean;
     privateResult?: boolean;
     // Bot-mention summon: always answer publicly with a placeholder, no
     // matter what the chat's delivery mode says.
@@ -1033,6 +1069,7 @@ async function handleVoice(
     ackMessageId,
     businessConnectionId: opts.businessConnectionId,
     businessUserChatId: opts.businessUserChatId,
+    businessOutgoing: opts.businessOutgoing,
     delivery,
   });
   // Pull the freshly-generated shortId and link it back to the chat-log
@@ -1760,11 +1797,23 @@ async function handleSettingsCallback(
 
   await answerCallbackQuery(cb.id, toast);
 
-  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
-    chatId,
-  })) as ResolvedChatSettings;
-  const text = renderSettingsText(view, settings);
-  const keyboard = buildSettingsKeyboard(view, settings, chatId, ephId);
+  // Private chats (positive ids) have their own main panel — the group
+  // main view is full of group-only toggles. Submenus (model, defaults)
+  // are shared between both panels.
+  const isPrivatePanel = chatId > 0;
+  let text: string;
+  let keyboard: InlineKeyboard;
+  if (isPrivatePanel && view === "main") {
+    const panel = await renderDmSettingsPanel(ctx, cb.from.id, chatId);
+    text = panel.text;
+    keyboard = panel.keyboard;
+  } else {
+    const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+      chatId,
+    })) as ResolvedChatSettings;
+    text = renderSettingsText(view, settings);
+    keyboard = buildSettingsKeyboard(view, settings, chatId, ephId);
+  }
   if (ephId) {
     await editEphemeralMessageText(chatId, cb.from.id, ephId, text, {
       parseMode: "HTML",
@@ -1774,6 +1823,143 @@ async function handleSettingsCallback(
     await editMessageText(cb.message.chat.id, cb.message.message_id, text, {
       parseMode: "HTML",
       inlineKeyboard: keyboard,
+    });
+  }
+}
+
+// ---- DM /settings: private-mode panel (business + personal defaults) ------
+
+// The bot DM has no delivery modes or reactions — voices are always
+// answered instantly and everything is private already. What it does have:
+// the summarizer model + default style for the owner's voices (both DM and
+// business ones), and per-conversation toggles for Telegram Business mode.
+async function renderDmSettingsPanel(
+  ctx: { runQuery: any },
+  userId: number,
+  chatId: number,
+): Promise<{ text: string; keyboard: InlineKeyboard }> {
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  })) as ResolvedChatSettings;
+  const connection = await ctx.runQuery(
+    internal.businessConnections.findEnabledByUser,
+    { userId },
+  );
+  const conversations = connection
+    ? await ctx.runQuery(internal.businessChatSettings.listByConnection, {
+        connectionId: connection.connectionId,
+        limit: 15,
+      })
+    : [];
+
+  const lines: string[] = [
+    "<b>⚙️ Настройки в личке</b>",
+    "",
+    `🧠 Модель: <b>${escapeHtml(SUMMARIZE_MODEL_OPTIONS[settings.summarizeModelKey].label)}</b> · стиль/контекст/детали ниже — применяются к вашим войсам в личке и в бизнес-переписках.`,
+    "",
+  ];
+  if (!connection) {
+    lines.push(
+      "<i>Подключите бота как менеджера аккаунта (Telegram → Настройки → Telegram Business → Чат-боты), и здесь появятся ваши переписки.</i>",
+    );
+  } else if (conversations.length === 0) {
+    lines.push(
+      "<b>Переписки</b>",
+      "<i>Бот подключён к аккаунту. Как только в какой-нибудь переписке появится голосовое, она появится здесь со своими настройками.</i>",
+    );
+  } else {
+    lines.push(
+      "<b>Переписки</b>",
+      "📤 — расшифровка вашего исходящего войса сразу отправляется собеседнику в эту переписку (от имени вашего аккаунта). По умолчанию выключено; нажмите на переписку, чтобы переключить.",
+      "Входящие войсы собеседников всегда расшифровываются сюда, в чат с ботом — Telegram не даёт показать расшифровку в самой переписке так, чтобы её не видел собеседник.",
+    );
+  }
+
+  const keyboard: InlineKeyboard = [];
+  const cb = (op: string) => settingsCb(chatId, 0, op);
+  keyboard.push([
+    {
+      text: `🧠 ${SUMMARIZE_MODEL_OPTIONS[settings.summarizeModelKey].label}`,
+      callback_data: cb("o"),
+    },
+  ]);
+  keyboard.push([
+    { text: `📝 ${modeLabel(settings.mode as any)}`, callback_data: cb("fm") },
+    {
+      text: `🎭 ${contextLabel(settings.context as any)}`,
+      callback_data: cb("fc"),
+    },
+    { text: `📊 ${settings.detail}`, callback_data: cb("fd") },
+  ]);
+  for (const conv of conversations) {
+    const name = conv.peerName ?? `чат ${conv.peerChatId}`;
+    const on = conv.autoSendTranscript === true;
+    keyboard.push([
+      {
+        text: on ? `📤 ${name} — авто-отправка` : `💤 ${name}`,
+        ...(on ? { style: "success" as const } : {}),
+        callback_data: `bt:${conv.peerChatId}`,
+      },
+    ]);
+  }
+  keyboard.push([
+    { text: "✖️ Закрыть", style: "danger" as const, callback_data: cb("x") },
+  ]);
+  return { text: lines.join("\n"), keyboard };
+}
+
+async function handleDmSettingsCommand(
+  ctx: { runMutation: any; runQuery: any },
+  message: TgMessage,
+): Promise<void> {
+  const userId = message.from?.id;
+  if (!userId) return;
+  const panel = await renderDmSettingsPanel(ctx, userId, message.chat.id);
+  await sendMessage(message.chat.id, panel.text, {
+    parseMode: "HTML",
+    inlineKeyboard: panel.keyboard,
+  });
+}
+
+// bt:<peerChatId> — toggles autoSendTranscript for one business
+// conversation and re-renders the DM panel in place.
+async function handleBusinessToggleCallback(
+  ctx: { runMutation: any; runQuery: any },
+  cb: TgCallbackQuery,
+  parts: string[],
+): Promise<void> {
+  const peerChatId = Number(parts[1]);
+  if (!Number.isFinite(peerChatId)) {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+  const connection = await ctx.runQuery(
+    internal.businessConnections.findEnabledByUser,
+    { userId: cb.from.id },
+  );
+  if (!connection) {
+    await answerCallbackQuery(cb.id, "Бот не подключён к аккаунту", true);
+    return;
+  }
+  const enabled: boolean = await ctx.runMutation(
+    internal.businessChatSettings.toggleAutoSend,
+    { connectionId: connection.connectionId, peerChatId },
+  );
+  await answerCallbackQuery(
+    cb.id,
+    enabled
+      ? "📤 Расшифровки ваших войсов будут отправляться собеседнику"
+      : "💤 Авто-отправка выключена",
+  );
+  if (cb.message) {
+    const panel = await renderDmSettingsPanel(
+      ctx,
+      cb.from.id,
+      cb.message.chat.id,
+    );
+    await editMessageText(cb.message.chat.id, cb.message.message_id, panel.text, {
+      parseMode: "HTML",
+      inlineKeyboard: panel.keyboard,
     });
   }
 }
@@ -2185,8 +2371,23 @@ const GROUP_STYLE_MODE_KEYS: Exclude<ModeKey, "auto">[] = [
   "keyPoints",
 ];
 
-// gs:<shortId> — opens an ephemeral mode picker for the voice author.
-// Uses the callback's 15-second window, so it works without admin rights.
+// True when this user may restyle the voice's chat message: its author,
+// or — for business voices — the account owner (the summary lives in the
+// owner's DM, and incoming voices are authored by the peer).
+function canRestyleVoice(userId: number, voice: Doc<"voiceMessages">): boolean {
+  if (userId === voice.fromId) return true;
+  return (
+    voice.businessUserChatId !== undefined &&
+    userId === voice.businessUserChatId
+  );
+}
+
+// gs:<shortId> — opens a style picker for the voice author. In groups it's
+// an ephemeral message (uses the callback's 15-second window, so it works
+// without admin rights); in private chats (bot DM, business results)
+// ephemeral sends aren't available — Telegram only supports them in
+// groups — so the picker is a regular message, which is fine there since
+// the whole chat is private anyway.
 async function openGroupStylePicker(
   ctx: { runQuery: any },
   cb: TgCallbackQuery,
@@ -2199,7 +2400,7 @@ async function openGroupStylePicker(
     await answerCallbackQuery(cb.id, "Сообщение не найдено");
     return;
   }
-  if (cb.from.id !== voice.fromId) {
+  if (!canRestyleVoice(cb.from.id, voice)) {
     await answerCallbackQuery(
       cb.id,
       "Только автор голосового может менять стиль в чате",
@@ -2217,6 +2418,20 @@ async function openGroupStylePicker(
       })),
     );
   }
+
+  if (cb.message?.chat.type === "private") {
+    await answerCallbackQuery(cb.id);
+    await sendMessage(
+      cb.message.chat.id,
+      "Стиль summary для этого голосового:",
+      {
+        inlineKeyboard: rows,
+        replyToMessageId: cb.message.message_id,
+      },
+    );
+    return;
+  }
+
   const eph = await sendEphemeralMessage(
     voice.chatId,
     cb.from.id,
@@ -2248,7 +2463,7 @@ async function applyGroupStyle(
     await answerCallbackQuery(cb.id, "Сообщение не найдено");
     return;
   }
-  if (cb.from.id !== voice.fromId) {
+  if (!canRestyleVoice(cb.from.id, voice)) {
     await answerCallbackQuery(cb.id, "Только автор голосового", true);
     return;
   }
@@ -2874,8 +3089,9 @@ async function loadOrGenerateForSession(
     loreRows && loreRows.length > 0
       ? loreRows.map((r: any) => `- ${r.text}`).join("\n")
       : null;
+  // Business voices: the model pick lives in the owner's DM settings.
   const chatSettings = await ctx.runQuery(internal.chatSettings.getResolved, {
-    chatId: voice.chatId,
+    chatId: voice.businessUserChatId ?? voice.chatId,
   });
   const { text } = await getOrGenerateSummary(ctx, voice._id, {
     transcript: voice.transcript,
@@ -2906,6 +3122,10 @@ async function handleCallback(
   try {
     if (parts[0] === "st") {
       await handleSettingsCallback(ctx, cb, parts);
+      return;
+    }
+    if (parts[0] === "bt" && parts.length === 2) {
+      await handleBusinessToggleCallback(ctx, cb, parts);
       return;
     }
     if (parts[0] === "mm") {
@@ -3259,7 +3479,7 @@ async function applyToChat(
     await answerCallbackQuery(cb.id, "Сообщение не найдено");
     return;
   }
-  if (cb.from.id !== voice.fromId) {
+  if (!canRestyleVoice(cb.from.id, voice)) {
     await answerCallbackQuery(
       cb.id,
       "Только автор сообщения может менять отображение в чате",
@@ -3318,7 +3538,7 @@ async function regenerateVoiceInChat(
   if (!voice.transcript) return;
   const debugMode = await ctx.runQuery(internal.botConfig.getDebugMode, {});
   const chatSettings = await ctx.runQuery(internal.chatSettings.getResolved, {
-    chatId: voice.chatId,
+    chatId: voice.businessUserChatId ?? voice.chatId,
   });
   const memory = await ctx.runQuery(internal.chatMemory.get, {
     chatId: voice.chatId,
@@ -3364,10 +3584,13 @@ async function regenerateVoiceInChat(
     debug: debugMode,
   });
   const keyboard = buildOpenInBotKeyboard(botUsername, voice.shortId);
+  // Business voices live in a managed conversation, but the bot's summary
+  // message for them is in the OWNER's DM — restyle edits go there.
+  const isBusinessResult = voice.businessUserChatId !== undefined;
   await commitFinal({
-    chatId: voice.chatId,
+    chatId: voice.businessUserChatId ?? voice.chatId,
     ackId: voice.ackMessageId,
-    replyTo: voice.messageId,
+    replyTo: isBusinessResult ? undefined : voice.messageId,
     ...rendered,
     keyboard,
   });

@@ -386,6 +386,35 @@ export async function setMyCommands(
   await rawTelegramMethod("setMyCommands", { commands });
 }
 
+// ---- Business mode (Bot API 7.2+) -----------------------------------------
+
+// Sends a message INTO a managed private conversation on behalf of the
+// connected business account (the peer sees it as coming from the owner,
+// with the bot badge). Used for the per-conversation "auto-send transcript
+// of my outgoing voices" toggle.
+export async function sendBusinessMessage(
+  businessConnectionId: string,
+  chatId: number,
+  text: string,
+  opts: { replyToMessageId?: number; parseMode?: ParseMode } = {},
+): Promise<{ message_id: number }> {
+  return await rawTelegramMethod("sendMessage", {
+    business_connection_id: businessConnectionId,
+    chat_id: chatId,
+    text,
+    link_preview_options: { is_disabled: true },
+    ...(opts.replyToMessageId !== undefined
+      ? {
+          reply_parameters: {
+            message_id: opts.replyToMessageId,
+            allow_sending_without_reply: true,
+          },
+        }
+      : {}),
+    ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+  });
+}
+
 // "typing…" indicator while the Q&A model thinks.
 export async function sendChatAction(
   chatId: number,

@@ -89,6 +89,11 @@ export default defineSchema({
     // customer-facing dialog.
     businessConnectionId: v.optional(v.string()),
     businessUserChatId: v.optional(v.number()),
+    // True when the business voice was SENT by the account owner (as
+    // opposed to received from the peer). Outgoing voices can be
+    // auto-transcribed into the managed chat for the peer when the
+    // conversation's autoSendTranscript toggle is on.
+    businessOutgoing: v.optional(v.boolean()),
     timings: v.optional(
       v.object({
         transcribeMs: v.optional(v.number()),
@@ -122,7 +127,26 @@ export default defineSchema({
     rights: v.optional(v.any()),
     connectedAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_connection", ["connectionId"]),
+  })
+    .index("by_connection", ["connectionId"])
+    .index("by_user", ["userId"]),
+
+  // Per-conversation settings for Telegram Business mode (the bot manages
+  // the owner's personal account). One row per (connection, peer chat),
+  // materialized the first time a voice from that conversation is seen so
+  // the owner's DM /settings panel can list conversations with toggles.
+  businessChatSettings: defineTable({
+    connectionId: v.string(),
+    peerChatId: v.number(),
+    peerName: v.optional(v.string()),
+    // When the OWNER sends a voice in this conversation, post its
+    // transcript into the conversation (visible to the peer, sent from
+    // the owner's account) right after transcription. Default off.
+    autoSendTranscript: v.optional(v.boolean()),
+    lastSeenAt: v.number(),
+  })
+    .index("by_connection_peer", ["connectionId", "peerChatId"])
+    .index("by_connection_seen", ["connectionId", "lastSeenAt"]),
 
   // Summary cache — one row per unique (voice, mode, context, detail)
   // combination. Mode and context are always concrete keys (never "auto")

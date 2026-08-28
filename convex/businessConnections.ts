@@ -11,6 +11,21 @@ export const get = internalQuery({
   },
 });
 
+// The user's most recent enabled connection — used by the DM /settings
+// panel to find the conversations managed for whoever opened it.
+export const findEnabledByUser = internalQuery({
+  args: { userId: v.number() },
+  handler: async (ctx, { userId }) => {
+    const rows = await ctx.db
+      .query("businessConnections")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .collect();
+    const enabled = rows.filter((r) => r.isEnabled);
+    enabled.sort((a, b) => b.updatedAt - a.updatedAt);
+    return enabled[0] ?? null;
+  },
+});
+
 export const upsert = internalMutation({
   args: {
     connectionId: v.string(),
