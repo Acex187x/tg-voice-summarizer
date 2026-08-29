@@ -57,7 +57,7 @@ The Telegram side uses [grammY](https://grammy.dev)'s `Api` client.
 
    | Variable | Default | Meaning |
    |---|---|---|
-   | `OPENROUTER_API_KEY` | (unset) | Only needed if you point a stage at OpenRouter via `/setmodel`. Transcription always uses OpenAI. |
+   | `OPENROUTER_API_KEY` | (unset) | Needed for the router and summarizer stages (both default to OpenRouter in `convex/models.ts`). Transcription always uses OpenAI. |
    | `ALLOWED_CHAT_IDS` | (all chats) | Comma-separated list of group/chat IDs the bot will process. If empty, the bot processes voices from any group it is in. |
 
 4. Run the one-shot setup:
@@ -145,10 +145,10 @@ In the bot's DM `/settings` opens the private-mode panel instead:
   flowing through Telegram Business conversations.
 - **Business conversations** (when the bot is connected as the account's
   chat-bot manager): one row per conversation that has had a voice, with a
-  per-conversation **auto-send** toggle — when on, the transcript of a
-  voice the OWNER sends in that conversation is posted right back into it
-  (the peer sees it from the owner's account) as soon as transcription
-  finishes. Off by default.
+  per-conversation **auto-send** toggle — when on, the summary of a voice
+  the OWNER sends in that conversation is posted right back into it (the
+  peer sees it from the owner's account) as soon as generation finishes.
+  Off by default.
 
 Every business summary in the owner's DM arrives as an **external reply**
 (Bot API cross-chat reply) to the original voice in the managed
