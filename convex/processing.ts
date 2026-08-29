@@ -39,6 +39,7 @@ import {
 import {
   deleteMessage,
   downloadFile,
+  editMessageReplyMarkup,
   editMessageText,
   escapeHtml,
   getFilePath,
@@ -93,9 +94,16 @@ async function loadChatLore(
 // (legacy rows from before the shortId field existed).
 function buildVoiceCancelKeyboard(
   shortId: string | undefined,
+  business?: { state: "idle" | "queued" | "sent" },
 ): InlineKeyboard | undefined {
   if (!shortId) return undefined;
-  return [[{ text: "❌ Отмена", callback_data: `dv:${shortId}` }]];
+  const rows: InlineKeyboard = [];
+  // Business outgoing voices carry the send button from the very first
+  // placeholder, so the owner can fire off the delivery without waiting
+  // for the summary — the press is queued and honored when it's ready.
+  if (business) rows.push([businessSendButton(shortId, business.state)]);
+  rows.push([{ text: "❌ Отмена", callback_data: `dv:${shortId}` }]);
+  return rows;
 }
 function buildChatSummaryCancelKeyboard(
   shortId: string | undefined,
@@ -156,7 +164,28 @@ export const processVoiceMessage = internalAction({
     const ackId = record.ackMessageId;
     const responseChatId = record.businessUserChatId ?? record.chatId;
     const isBusinessPrivateResult = record.businessUserChatId !== undefined;
-    const cancelKeyboard = buildVoiceCancelKeyboard(record.shortId);
+    const isBusinessSendable =
+      record.businessConnectionId !== undefined &&
+      record.businessOutgoing === true;
+    // Re-read the row so the placeholder's send button reflects a press
+    // that landed since the last edit (otherwise a stage transition would
+    // silently reset it to "idle").
+    const freshCancelKeyboard = async (): Promise<InlineKeyboard | undefined> => {
+      if (!isBusinessSendable) return buildVoiceCancelKeyboard(record.shortId);
+      const row = await ctx.runQuery(internal.voiceMessages.get, { id });
+      return buildVoiceCancelKeyboard(record.shortId, {
+        state:
+          row?.businessSentAt !== undefined
+            ? "sent"
+            : row?.businessSendQueued === true
+              ? "queued"
+              : "idle",
+      });
+    };
+    const cancelKeyboard = buildVoiceCancelKeyboard(
+      record.shortId,
+      isBusinessSendable ? { state: "idle" } : undefined,
+    );
     const startedAt = Date.now();
     const timings: {
       transcribeMs?: number;
@@ -217,12 +246,6 @@ export const processVoiceMessage = internalAction({
           value: chatSettingsEarly.reaction.value,
         });
       }
-      // Business mode: the owner's OUTGOING voice in a conversation with
-      // the auto-send toggle on gets its transcript posted right into the
-      // managed chat (the peer sees it as sent from the owner's account).
-      if (record.businessConnectionId && record.businessOutgoing) {
-        await maybeAutoSendBusinessTranscript(ctx, record, transcript);
-      }
       const linkedChatMessage = await ctx.runQuery(
         internal.chatMessages.findByMessage,
         { chatId: record.chatId, messageId: record.messageId },
@@ -260,6 +283,10 @@ export const processVoiceMessage = internalAction({
         if (ackId !== undefined) {
           await deleteMessage(responseChatId, ackId);
         }
+        // A queued "Отправить собеседнику" still deserves a delivery —
+        // there's no summary for a nonsense-filtered voice, so the peer
+        // gets the transcript instead.
+        await maybeDeliverBusinessSummary(ctx, record, null, transcript);
         // Silent-instant: drop the "processing" reaction; nothing will be
         // posted. (On-demand keeps its reaction — the transcript is still
         // servable ephemerally.)
@@ -280,7 +307,10 @@ export const processVoiceMessage = internalAction({
           responseChatId,
           ackId,
           `${loadingEmoji()} <i>Готовлю summary…</i>`,
-          { parseMode: "HTML", inlineKeyboard: cancelKeyboard },
+          {
+            parseMode: "HTML",
+            inlineKeyboard: await freshCancelKeyboard(),
+          },
         );
       }
       const sStart = Date.now();
@@ -356,6 +386,12 @@ export const processVoiceMessage = internalAction({
         businessSend:
           record.businessConnectionId !== undefined &&
           record.businessOutgoing === true,
+        businessState:
+          fresh?.businessSentAt !== undefined
+            ? "sent"
+            : fresh?.businessSendQueued === true
+              ? "queued"
+              : "idle",
       });
       await commitFinal({
         chatId: responseChatId,
@@ -364,6 +400,29 @@ export const processVoiceMessage = internalAction({
         ...rendered,
         keyboard,
       });
+
+      // Business: deliver the summary to the peer when the conversation's
+      // auto-send is on or the owner pressed "Отправить собеседнику"
+      // (possibly while this was still generating). Refresh the DM
+      // keyboard afterwards so the button reflects what happened.
+      if (record.businessConnectionId && record.businessOutgoing) {
+        const delivered = await maybeDeliverBusinessSummary(
+          ctx,
+          record,
+          summaryText,
+          transcript,
+        );
+        if (delivered && ackId !== undefined) {
+          await editMessageReplyMarkup(
+            responseChatId,
+            ackId,
+            buildOpenInBotKeyboard(botUsername, fresh?.shortId, {
+              businessSend: true,
+              businessState: "sent",
+            }),
+          );
+        }
+      }
 
       // Silent-instant mode used the trigger reaction as its "processing"
       // indicator — clear it now that the summary is posted.
@@ -412,28 +471,131 @@ export const processVoiceMessage = internalAction({
   },
 });
 
-// ---- Business transcript sends --------------------------------------------
+// ---- Business summary delivery to the peer --------------------------------
 
-// Posts a transcript into the managed conversation on behalf of the
-// owner's account, as a reply to the voice. Long transcripts go out as an
-// HTML-safe chunk chain. Shared by the auto-send toggle and the manual
-// "Отправить собеседнику" button. Throws on API failure — callers decide
-// whether that's fatal.
-export async function sendBusinessTranscript(
-  connectionId: string,
-  chatId: number,
-  voiceMessageId: number,
+// Builds the peer-facing message: a single collapsed block titled
+// "Summary голосового" holding the summary and a "сгенерировано @bot"
+// footer — so the conversation only shows the disclosure header until the
+// peer taps it. The raw transcript rides along in a second block only when
+// the owner turned that on in the DM settings.
+function buildBusinessSummaryRich(
+  summary: string | null,
+  transcript: string,
+  includeTranscript: boolean,
+  botUsername?: string | null,
+): string {
+  const footer = botUsername
+    ? `_сгенерировано @${botUsername}_`
+    : "_сгенерировано ботом-суммаризатором_";
+  const blocks: string[] = [];
+  if (summary) {
+    blocks.push(
+      [
+        "<details><summary>📝 Summary голосового</summary>",
+        "",
+        // Deliberately NOT summaryMarkdownToRichMarkdown: that turns `> `
+        // sections into their own <details>, and nesting disclosure blocks
+        // renders badly.
+        summary,
+        "",
+        footer,
+        "",
+        "</details>",
+      ].join("\n"),
+    );
+  }
+  // No summary (nonsense-filtered voice) → the transcript is all we have,
+  // so it becomes the one block instead of being dropped.
+  if (includeTranscript || !summary) {
+    blocks.push(
+      [
+        "<details><summary>🎙 Расшифровка</summary>",
+        "",
+        escapeRichText(transcript),
+        "",
+        ...(summary ? [] : [footer, ""]),
+        "</details>",
+      ].join("\n"),
+    );
+  }
+  return blocks.join("\n\n");
+}
+
+// Classic-HTML fallback for accounts/clients where rich messages aren't
+// available. Expandable blockquotes give the same "collapsed by default"
+// shape, just without the titled header.
+function buildBusinessSummaryHtml(
+  summary: string | null,
+  transcript: string,
+  includeTranscript: boolean,
+  botUsername?: string | null,
+): string {
+  const footer = botUsername
+    ? `<i>сгенерировано @${escapeHtml(botUsername)}</i>`
+    : "<i>сгенерировано ботом-суммаризатором</i>";
+  const parts: string[] = [];
+  if (summary) {
+    parts.push(
+      `<blockquote expandable><b>📝 Summary голосового</b>\n${markdownToTelegramHtml(summary)}\n\n${footer}</blockquote>`,
+    );
+  }
+  if (includeTranscript || !summary) {
+    parts.push(
+      `<blockquote expandable><b>🎙 Расшифровка</b>\n${escapeHtml(transcript)}${summary ? "" : `\n\n${footer}`}</blockquote>`,
+    );
+  }
+  return parts.join("\n\n");
+}
+
+// Posts the summary into the managed conversation on behalf of the owner's
+// account, as a reply to the voice. Rich message first (that's what gives
+// the tappable disclosure block), classic HTML on failure. Throws only if
+// both paths fail — callers decide whether that's fatal.
+export async function sendBusinessSummary(
+  ctx: { runQuery: any },
+  record: Doc<"voiceMessages">,
+  summary: string | null,
   transcript: string,
 ): Promise<void> {
-  const header = "🎙 <i>Расшифровка голосового:</i>\n";
-  const quoted = `${header}<blockquote expandable>${escapeHtml(transcript)}</blockquote>`;
+  const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId: record.businessUserChatId ?? record.chatId,
+  });
+  const botUsername = await ctx.runQuery(internal.botConfig.getBotUsername, {});
+  const includeTranscript = settings.businessIncludeTranscript === true;
+  const connectionId = record.businessConnectionId!;
+
+  const rich = buildBusinessSummaryRich(
+    summary,
+    transcript,
+    includeTranscript,
+    botUsername,
+  );
+  if (rich.length <= RICH_TEXT_LIMIT) {
+    try {
+      await sendRichMarkdownMessage(record.chatId, rich, {
+        businessConnectionId: connectionId,
+        replyToMessageId: record.messageId,
+      });
+      return;
+    } catch (err) {
+      console.warn(
+        "rich business summary failed, falling back to HTML",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  const html = buildBusinessSummaryHtml(
+    summary,
+    transcript,
+    includeTranscript,
+    botUsername,
+  );
   const chunks =
-    quoted.length <= TG_TEXT_LIMIT
-      ? [quoted]
-      : splitHtmlSafely(quoted, TG_TEXT_LIMIT);
-  let replyTo: number | undefined = voiceMessageId;
+    html.length <= TG_TEXT_LIMIT ? [html] : splitHtmlSafely(html, TG_TEXT_LIMIT);
+  let replyTo: number | undefined = record.messageId;
   for (const chunk of chunks) {
-    const sent = await sendBusinessMessage(connectionId, chatId, chunk, {
+    const sent = await sendBusinessMessage(connectionId, record.chatId, chunk, {
       replyToMessageId: replyTo,
       parseMode: "HTML",
     });
@@ -441,31 +603,45 @@ export async function sendBusinessTranscript(
   }
 }
 
-// Auto-send variant: only fires when the conversation's toggle is on, and
-// soft-fails — a revoked connection or missing permissions must not kill
-// the rest of the pipeline (the owner still gets their DM summary).
-async function maybeAutoSendBusinessTranscript(
-  ctx: { runQuery: any },
+// Delivers the summary to the peer when either the conversation's
+// auto-send toggle is on or the owner pressed "Отправить собеседнику"
+// (possibly before the summary existed — the press just queues the flag).
+// The claim is a single atomic mutation, so a press racing the pipeline
+// can never produce two sends; a failed send releases it for a retry.
+// Soft-fails: the owner still gets their DM summary regardless.
+export async function maybeDeliverBusinessSummary(
+  ctx: { runQuery: any; runMutation: any },
   record: Doc<"voiceMessages">,
+  summary: string | null,
   transcript: string,
-): Promise<void> {
+): Promise<boolean> {
+  if (!record.businessConnectionId || !record.businessOutgoing) return false;
   try {
     const convSettings = await ctx.runQuery(internal.businessChatSettings.get, {
-      connectionId: record.businessConnectionId!,
+      connectionId: record.businessConnectionId,
       peerChatId: record.chatId,
     });
-    if (convSettings?.autoSendTranscript !== true) return;
-    await sendBusinessTranscript(
-      record.businessConnectionId!,
-      record.chatId,
-      record.messageId,
-      transcript,
+    const auto = convSettings?.autoSendTranscript === true;
+    const claimed = await ctx.runMutation(
+      internal.voiceMessages.claimBusinessSend,
+      { id: record._id, onlyIfQueued: !auto },
     );
+    if (!claimed) return false;
+    try {
+      await sendBusinessSummary(ctx, record, summary, transcript);
+    } catch (err) {
+      await ctx.runMutation(internal.voiceMessages.releaseBusinessSend, {
+        id: record._id,
+      });
+      throw err;
+    }
+    return true;
   } catch (err) {
     console.warn(
-      "business transcript auto-send failed",
+      "business summary delivery failed",
       err instanceof Error ? err.message : String(err),
     );
+    return false;
   }
 }
 
@@ -832,11 +1008,13 @@ export function buildOpenInBotKeyboard(
   botUsername: string | undefined | null,
   shortId: string | undefined | null,
   opts: {
-    // Business outgoing voice: offer the one-tap "send transcript to the
-    // peer" button on the owner's DM summary. `sent` renders it as an
-    // inert confirmation after a successful manual send.
+    // Business outgoing voice: offer the one-tap "send summary to the
+    // peer" button. Shown on the loading placeholder too — pressing it
+    // early queues the delivery for when the summary is ready.
     businessSend?: boolean;
-    businessSent?: boolean;
+    // "idle" — pressable; "queued" — press registered, waiting on the
+    // summary; "sent" — already delivered (both inert).
+    businessState?: "idle" | "queued" | "sent";
   } = {},
 ): InlineKeyboard | undefined {
   if (!shortId) return undefined;
@@ -852,17 +1030,31 @@ export function buildOpenInBotKeyboard(
   row.push({ text: "❌", callback_data: `dv:${shortId}` });
   const rows: InlineKeyboard = [row];
   if (opts.businessSend) {
-    rows.unshift([
-      opts.businessSent
-        ? { text: "✓ Отправлено собеседнику", style: "success", disabled: {} }
-        : {
-            text: "📤 Отправить собеседнику",
-            style: "primary",
-            callback_data: `bx:${shortId}`,
-          },
-    ]);
+    rows.unshift([businessSendButton(shortId, opts.businessState ?? "idle")]);
   }
   return rows;
+}
+
+// The "Отправить собеседнику" button in each of its three states.
+export function businessSendButton(
+  shortId: string,
+  state: "idle" | "queued" | "sent",
+): InlineKeyboard[number][number] {
+  if (state === "sent") {
+    return { text: "✓ Отправлено собеседнику", style: "success", disabled: {} };
+  }
+  if (state === "queued") {
+    return {
+      text: "⏳ Отправлю, как будет готово",
+      style: "success",
+      callback_data: `bxc:${shortId}`,
+    };
+  }
+  return {
+    text: "📤 Отправить собеседнику",
+    style: "primary",
+    callback_data: `bx:${shortId}`,
+  };
 }
 
 // ---- Long-message handling -------------------------------------------------

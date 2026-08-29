@@ -22,7 +22,8 @@ import {
   renderChatSummaryFinal,
   renderFinal,
   resolveVoiceSettings,
-  sendBusinessTranscript,
+  businessSendButton,
+  sendBusinessSummary,
 } from "./processing";
 import {
   ALL_CONTEXT_KEYS,
@@ -138,6 +139,9 @@ type TgMessage = {
   document?: TgDocument;
   sticker?: TgSticker;
   reply_to_message?: TgMessage;
+  reply_markup?: {
+    inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>>;
+  };
 };
 type TgCallbackQuery = {
   id: string;
@@ -1734,6 +1738,20 @@ async function handleSettingsCallback(
       view = "main";
       break;
     }
+    case "bi": {
+      const cur = (await ctx.runQuery(internal.chatSettings.getResolved, {
+        chatId,
+      })) as ResolvedChatSettings;
+      await ctx.runMutation(internal.chatSettings.update, {
+        chatId,
+        businessIncludeTranscript: !cur.businessIncludeTranscript,
+      });
+      toast = cur.businessIncludeTranscript
+        ? "Собеседнику — только summary"
+        : "Собеседнику — summary вместе с расшифровкой";
+      view = "main";
+      break;
+    }
     case "r":
       view = "reaction";
       break;
@@ -1886,10 +1904,15 @@ async function renderDmSettingsPanel(
   } else {
     lines.push(
       "<b>Переписки</b>",
-      "📤 — расшифровка вашего исходящего войса сразу отправляется собеседнику в эту переписку (от имени вашего аккаунта). По умолчанию выключено; нажмите на переписку, чтобы переключить.",
+      "📤 — summary вашего исходящего войса автоматически отправляется собеседнику в эту переписку (от имени вашего аккаунта). По умолчанию выключено; нажмите на переписку, чтобы переключить.",
+      "Без авто-отправки то же самое делается кнопкой «📤 Отправить собеседнику» под сообщением бота — её можно нажать сразу, не дожидаясь генерации: отправлю, как только summary будет готов.",
       "Входящие войсы собеседников всегда расшифровываются сюда, в чат с ботом — Telegram не даёт показать расшифровку в самой переписке так, чтобы её не видел собеседник.",
     );
   }
+  lines.push(
+    "",
+    `📎 Собеседнику уходит: <b>${settings.businessIncludeTranscript ? "summary + расшифровка" : "только summary"}</b>`,
+  );
 
   const keyboard: InlineKeyboard = [];
   const cb = (op: string) => settingsCb(chatId, 0, op);
@@ -1906,6 +1929,15 @@ async function renderDmSettingsPanel(
       callback_data: cb("fc"),
     },
     { text: `📊 ${settings.detail}`, callback_data: cb("fd") },
+  ]);
+  keyboard.push([
+    settings.businessIncludeTranscript
+      ? {
+          text: "📎 Собеседнику: summary + расшифровка",
+          style: "success" as const,
+          callback_data: cb("bi"),
+        }
+      : { text: "📎 Собеседнику: только summary", callback_data: cb("bi") },
   ]);
   for (const conv of conversations) {
     const name = conv.peerName ?? `чат ${conv.peerChatId}`;
@@ -1980,16 +2012,19 @@ async function handleBusinessToggleCallback(
   }
 }
 
-// ---- «Отправить собеседнику»: manual business transcript send -------------
+// ---- «Отправить собеседнику»: business summary delivery -------------------
 
-// bx:<shortId> — one tap on the owner's DM summary posts the transcript
-// of their outgoing voice into the managed conversation (sent from the
-// owner's account, as a reply to the voice). On success the button turns
-// into an inert "✓ Отправлено" confirmation.
+// bx:<shortId> — one tap on the owner's DM message delivers the summary
+// of their outgoing voice into the managed conversation (from the owner's
+// account, as a reply to the voice). Pressable from the very first
+// "Обрабатываю…" placeholder: if the summary isn't ready yet the press is
+// QUEUED and the pipeline delivers it the moment generation finishes.
+// bxc:<shortId> — tap on the queued button, cancels that pending send.
 async function handleBusinessSendCallback(
   ctx: { runMutation: any; runQuery: any },
   cb: TgCallbackQuery,
   shortId: string,
+  cancel = false,
 ): Promise<void> {
   const voice = (await ctx.runQuery(internal.voiceMessages.getByShortId, {
     shortId,
@@ -1999,48 +2034,118 @@ async function handleBusinessSendCallback(
     return;
   }
   if (cb.from.id !== voice.businessUserChatId) {
-    await answerCallbackQuery(cb.id, "Кнопка только для владельца аккаунта", true);
-    return;
-  }
-  if (!voice.transcript) {
-    await answerCallbackQuery(cb.id, "Расшифровка ещё не готова — подождите");
-    return;
-  }
-  try {
-    await sendBusinessTranscript(
-      voice.businessConnectionId,
-      voice.chatId,
-      voice.messageId,
-      voice.transcript,
+    await answerCallbackQuery(
+      cb.id,
+      "Кнопка только для владельца аккаунта",
+      true,
     );
+    return;
+  }
+  if (voice.businessSentAt !== undefined) {
+    await answerCallbackQuery(cb.id, "Уже отправлено собеседнику");
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "sent");
+    return;
+  }
+
+  if (cancel) {
+    await ctx.runMutation(internal.voiceMessages.setBusinessSendQueued, {
+      id: voice._id,
+      queued: false,
+    });
+    await answerCallbackQuery(cb.id, "Отправка отменена");
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "idle");
+    return;
+  }
+
+  // Summary not ready yet (still transcribing/summarizing) → queue it.
+  const ready = voice.status === "done" && voice.transcript;
+  if (!ready) {
+    await ctx.runMutation(internal.voiceMessages.setBusinessSendQueued, {
+      id: voice._id,
+      queued: true,
+    });
+    await answerCallbackQuery(
+      cb.id,
+      "⏳ Отправлю собеседнику, как только summary будет готов",
+    );
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "queued");
+    return;
+  }
+
+  // Ready → claim and send right now.
+  const claimed: boolean = await ctx.runMutation(
+    internal.voiceMessages.claimBusinessSend,
+    { id: voice._id, onlyIfQueued: false },
+  );
+  if (!claimed) {
+    await answerCallbackQuery(cb.id, "Уже отправлено собеседнику");
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "sent");
+    return;
+  }
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId: voice.businessUserChatId ?? voice.chatId,
+  })) as ResolvedChatSettings;
+  const session = {
+    mode: (voice.displayedMode ?? "auto") as ModeKey,
+    context: (voice.displayedContext ?? "auto") as ContextKey,
+    detail: (voice.displayedDetail ?? settings.detail) as Detail,
+  };
+  try {
+    const summary = await loadOrGenerateForSession(ctx, voice, session);
+    await sendBusinessSummary(ctx, voice, summary, voice.transcript!);
   } catch (err) {
     console.warn(
-      "manual business transcript send failed",
+      "manual business summary send failed",
       err instanceof Error ? err.message : String(err),
     );
+    await ctx.runMutation(internal.voiceMessages.releaseBusinessSend, {
+      id: voice._id,
+    });
     await answerCallbackQuery(
       cb.id,
       "Не удалось отправить — проверьте, что бот всё ещё подключён к аккаунту",
       true,
     );
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "idle");
     return;
   }
   await answerCallbackQuery(cb.id, "📤 Отправлено собеседнику");
-  if (cb.message) {
-    const botUsername = await ctx.runQuery(
-      internal.botConfig.getBotUsername,
-      {},
+  await refreshBusinessSendKeyboard(ctx, cb, shortId, "sent");
+}
+
+// Re-renders just the send button on whichever message carries it (the
+// loading placeholder or the finished summary — both use the same
+// keyboard shape).
+async function refreshBusinessSendKeyboard(
+  ctx: { runQuery: any },
+  cb: TgCallbackQuery,
+  shortId: string,
+  state: "idle" | "queued" | "sent",
+): Promise<void> {
+  if (!cb.message) return;
+  const hasCancelRow = (cb.message.reply_markup?.inline_keyboard ?? []).some(
+    (row) => row.some((b) => b.callback_data === `dv:${shortId}`),
+  );
+  const isPlaceholder =
+    hasCancelRow &&
+    !(cb.message.reply_markup?.inline_keyboard ?? []).some((row) =>
+      row.some((b) => b.callback_data === `gs:${shortId}`),
     );
-    const keyboard = buildOpenInBotKeyboard(botUsername, shortId, {
-      businessSend: true,
-      businessSent: true,
-    });
-    await editMessageReplyMarkup(
-      cb.message.chat.id,
-      cb.message.message_id,
-      keyboard,
-    );
-  }
+  const keyboard: InlineKeyboard = isPlaceholder
+    ? [
+        [businessSendButton(shortId, state)],
+        [{ text: "❌ Отмена", callback_data: `dv:${shortId}` }],
+      ]
+    : (buildOpenInBotKeyboard(
+        await ctx.runQuery(internal.botConfig.getBotUsername, {}),
+        shortId,
+        { businessSend: true, businessState: state },
+      ) ?? []);
+  await editMessageReplyMarkup(
+    cb.message.chat.id,
+    cb.message.message_id,
+    keyboard,
+  ).catch(() => {});
 }
 
 // ---- /reaction: change the on-demand trigger reaction ---------------------
@@ -3211,6 +3316,10 @@ async function handleCallback(
       await handleBusinessSendCallback(ctx, cb, parts[1]);
       return;
     }
+    if (parts[0] === "bxc" && parts.length === 2) {
+      await handleBusinessSendCallback(ctx, cb, parts[1], true);
+      return;
+    }
     if (parts[0] === "mm") {
       await handleModalCallback(ctx, cb, parts);
       return;
@@ -3670,6 +3779,12 @@ async function regenerateVoiceInChat(
     businessSend:
       voice.businessConnectionId !== undefined &&
       voice.businessOutgoing === true,
+    businessState:
+      voice.businessSentAt !== undefined
+        ? "sent"
+        : voice.businessSendQueued === true
+          ? "queued"
+          : "idle",
   });
   // Business voices live in a managed conversation, but the bot's summary
   // message for them is in the OWNER's DM — restyle edits go there.

@@ -94,6 +94,15 @@ export default defineSchema({
     // auto-transcribed into the managed chat for the peer when the
     // conversation's autoSendTranscript toggle is on.
     businessOutgoing: v.optional(v.boolean()),
+    // "Отправить собеседнику" pressed while the voice was still
+    // processing: the pipeline claims this flag (atomically, via
+    // claimBusinessSend) once the summary is ready and delivers it to the
+    // peer.
+    businessSendQueued: v.optional(v.boolean()),
+    // Set once the summary has actually been delivered to the peer (by
+    // the button, the queued press, or the auto-send toggle). Doubles as
+    // the de-duplication guard — claimBusinessSend refuses a second send.
+    businessSentAt: v.optional(v.number()),
     timings: v.optional(
       v.object({
         transcribeMs: v.optional(v.number()),
@@ -203,6 +212,11 @@ export default defineSchema({
     // Human-readable form of a custom_emoji reaction (the emoji char the
     // custom emoji is based on) for menus/messages.
     reactionDisplay: v.optional(v.string()),
+    // Business mode, stored on the OWNER's DM chat row: include the raw
+    // transcript (as a second collapsed block) when sending a voice
+    // summary to the peer — both auto-send and the manual button.
+    // Default off: only the summary goes out.
+    businessIncludeTranscript: v.optional(v.boolean()),
     // === LEGACY ===
     // Pre-/settings quiet mode flag. Read only as a fallback when
     // deliveryMode is absent (quietMode=true → "onDemand"). New code

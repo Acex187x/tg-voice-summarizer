@@ -215,6 +215,45 @@ export const markCancelled = internalMutation({
   },
 });
 
+// ---- Business "send to peer" queue ----------------------------------------
+
+// Marks/unmarks the voice as "deliver the summary to the peer as soon as
+// it's ready" (button pressed while the pipeline was still running).
+export const setBusinessSendQueued = internalMutation({
+  args: { id: v.id("voiceMessages"), queued: v.boolean() },
+  handler: async (ctx, { id, queued }) => {
+    await ctx.db.patch(id, { businessSendQueued: queued });
+  },
+});
+
+// Atomically claims the right to deliver this voice's summary to the peer.
+// Returns false when another path already delivered it (businessSentAt is
+// set) or, with onlyIfQueued, when nothing was queued. Single mutation, so
+// a button press racing the pipeline can never produce two sends.
+export const claimBusinessSend = internalMutation({
+  args: { id: v.id("voiceMessages"), onlyIfQueued: v.boolean() },
+  handler: async (ctx, { id, onlyIfQueued }): Promise<boolean> => {
+    const row = await ctx.db.get(id);
+    if (!row) return false;
+    if (row.businessSentAt !== undefined) return false;
+    if (onlyIfQueued && row.businessSendQueued !== true) return false;
+    await ctx.db.patch(id, {
+      businessSentAt: Date.now(),
+      businessSendQueued: false,
+    });
+    return true;
+  },
+});
+
+// Rolls the claim back when the Telegram send itself failed, so the owner
+// can retry with the button.
+export const releaseBusinessSend = internalMutation({
+  args: { id: v.id("voiceMessages") },
+  handler: async (ctx, { id }) => {
+    await ctx.db.patch(id, { businessSentAt: undefined });
+  },
+});
+
 export const setTimings = internalMutation({
   args: {
     id: v.id("voiceMessages"),

@@ -37,6 +37,7 @@ export interface ResolvedChatSettings {
   skipLoadingMessage: boolean;
   channelVoicesInstant: boolean;
   reaction: ChatReaction;
+  businessIncludeTranscript: boolean;
 }
 
 // Resolves per-chat defaults. Rows in chatSettings override the hardcoded
@@ -74,6 +75,7 @@ export const getResolved = internalQuery({
       skipLoadingMessage: row?.skipLoadingMessage === true,
       channelVoicesInstant: row?.channelVoicesInstant !== false,
       reaction,
+      businessIncludeTranscript: row?.businessIncludeTranscript === true,
     };
   },
 });
@@ -98,6 +100,7 @@ export const update = internalMutation({
     ),
     reactionValue: v.optional(v.string()),
     reactionDisplay: v.optional(v.string()),
+    businessIncludeTranscript: v.optional(v.boolean()),
   },
   handler: async (ctx, { chatId, ...patch }) => {
     const defined = Object.fromEntries(

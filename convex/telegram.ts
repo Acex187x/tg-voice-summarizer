@@ -453,11 +453,20 @@ export const RICH_TEXT_LIMIT = 32000;
 export async function sendRichMarkdownMessage(
   chatId: number,
   markdown: string,
-  opts: { replyToMessageId?: number; inlineKeyboard?: InlineKeyboard } = {},
+  opts: {
+    replyToMessageId?: number;
+    inlineKeyboard?: InlineKeyboard;
+    // Send on behalf of a connected business account (works only if the
+    // account itself can send rich messages).
+    businessConnectionId?: string;
+  } = {},
 ): Promise<{ message_id: number }> {
   return await rawTelegramMethod("sendRichMessage", {
     chat_id: chatId,
     rich_message: { markdown },
+    ...(opts.businessConnectionId
+      ? { business_connection_id: opts.businessConnectionId }
+      : {}),
     ...(opts.replyToMessageId !== undefined
       ? {
           reply_parameters: {
