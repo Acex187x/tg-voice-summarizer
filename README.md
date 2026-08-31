@@ -57,7 +57,7 @@ The Telegram side uses [grammY](https://grammy.dev)'s `Api` client.
 
    | Variable | Default | Meaning |
    |---|---|---|
-   | `OPENROUTER_API_KEY` | (unset) | Only needed if you point a stage at OpenRouter via `/setmodel`. Transcription always uses OpenAI. |
+   | `OPENROUTER_API_KEY` | (unset) | Needed for the router and summarizer stages (both default to OpenRouter in `convex/models.ts`). Transcription always uses OpenAI. |
    | `ALLOWED_CHAT_IDS` | (all chats) | Comma-separated list of group/chat IDs the bot will process. If empty, the bot processes voices from any group it is in. |
 
 4. Run the one-shot setup:
@@ -81,29 +81,101 @@ To deploy to production instead of the dev deployment:
 npm run setup:prod
 ```
 
-## Admin commands
+## Commands
 
-All commands work in a private chat with the bot. Some also work inside
-groups (in particular `/summarize` as a reply).
+Group commands (any member):
+
+```
+/settings        chat settings panel (ephemeral — visible only to you)
+/reaction <emo>  change the on-demand trigger reaction (plain or premium emoji)
+/summary [args]  summarize a slice of the chat history
+/search, /ask    semantic search / grounded Q&A over the chat history
+/modal           pick the summarizer model (alias for a /settings submenu)
+/quiet           toggle on-demand mode (alias for a /settings switch)
+```
+
+Admin commands (private chat with the bot or groups):
 
 ```
 /start, /help    show help
 /whoami          print your Telegram user ID and the chat ID
-/types           list configured voice-message types (with their IDs)
-/addtype         step-by-step wizard to add a new type
-/edittype <id>   change a single field of an existing type
-/deltype <id>    delete a type
 /summarize       reply to a voice/audio message to (re)summarize it
-/models          show which LLM model each pipeline stage uses
-/setmodel ...    change the model for a stage (see below)
-/resetmodels     reset every stage back to code defaults
-/debug [on|off]  toggle debug mode (adds type/models/timings to the quote)
-/cancel          cancel any in-progress wizard
+/defaults        show/set default summary mode+context+detail for the chat
+/debug [on|off]  toggle debug mode (adds models/timings to the quote)
+/importdump      import a Telegram JSON export into the search index
+/indexstats      DB / vector-index coverage stats
 ```
 
 Unknown commands and plain (non-command) text from the owner are
-intentionally silent — the bot never says "I don't understand". Wizards
-(`/addtype` etc.) only accept input in a private chat with the bot.
+intentionally silent — the bot never says "I don't understand".
+
+### Chat settings (/settings)
+
+The `/settings` panel is sent ephemerally (only the invoker sees it) and
+uses Bot API 9.4/10.3 styled buttons. It controls, per chat:
+
+- **Режим ответа** — `Сразу в чат` (loading placeholder → summary, the
+  classic flow) or `По требованию` (nothing is posted; the bot marks a
+  processed voice with the trigger reaction, and a member putting the same
+  reaction on the voice receives the transcription as an ephemeral message
+  only they can see). On-demand mode needs the bot to be a chat admin and
+  the trigger reaction to be enabled in the chat.
+- **Сообщение о загрузке** — when disabled (instant mode only), the bot
+  skips the placeholder: it puts the trigger reaction on the voice while
+  processing and posts the finished summary directly.
+- **Войсы от имени канала** — channel posts auto-forwarded into the linked
+  discussion chat and voices sent "as the channel" are always processed
+  instantly with a visible placeholder, regardless of the other settings
+  (on by default).
+- **Реакция-триггер** — defaults to 👀; presets in the panel, arbitrary
+  (including premium/custom) emoji via `/reaction`.
+- **Модель / стиль / контекст / детальность** — per-chat summarizer model
+  and default summary settings.
+
+Mentioning the bot in a reply to any voice always posts a public
+transcription of that voice, in every mode; in on-demand mode the bot also
+deletes the mention message to keep the chat clean.
+
+### Private mode (/settings in the bot DM)
+
+In the bot's DM `/settings` opens the private-mode panel instead:
+
+- **Summarizer model + default style/context/detail** for the owner's own
+  voices — applies both to voices sent straight to the bot and to voices
+  flowing through Telegram Business conversations.
+- **Business conversations** (when the bot is connected as the account's
+  chat-bot manager): one row per conversation that has had a voice, with a
+  per-conversation **auto-send** toggle — when on, the summary of a voice
+  the OWNER sends in that conversation is posted right back into it (the
+  peer sees it from the owner's account) as soon as generation finishes.
+  Off by default.
+
+Every business summary in the owner's DM arrives as an **external reply**
+(Bot API cross-chat reply) to the original voice in the managed
+conversation — tapping the quote header jumps straight into that dialog.
+
+Summaries of the owner's OUTGOING voices carry a one-tap **«📤 Отправить
+собеседнику»** button, present from the very first "Обрабатываю…"
+placeholder: pressing it before the summary exists queues the delivery and
+the pipeline sends it the moment generation finishes (press again to
+cancel while it's queued). The claim is a single atomic mutation, so a
+press racing the pipeline can't produce a double send.
+
+What the peer receives is a **rich message with one collapsed block**
+titled "📝 Summary голосового" — the summary plus a "сгенерировано @bot"
+footer, nothing else visible until they expand it. The raw transcript is
+added as a second block only when **«📎 Собеседнику: summary +
+расшифровка»** is enabled in the DM panel (off by default). Clients that
+can't take rich messages fall back to expandable blockquotes. Telegram
+can't forward a message on behalf of a business account
+(`forwardMessage` has no `business_connection_id`), which is why the
+"generated by" attribution is a footer rather than a forward header.
+
+Incoming voices from peers are always transcribed into the owner's DM with
+the bot — Telegram has no way to show a transcript inside a private
+conversation that only one side can see (ephemeral messages are
+group-only). The style buttons under a DM summary open a regular picker
+message there (ephemeral pickers are likewise group-only).
 
 ### How a voice reply looks
 
@@ -124,21 +196,14 @@ which model handled each stage, and per-stage timings.
 ### Changing models per stage
 
 The pipeline has three stages, each driven by a separately-configurable
-model:
+model. The transcribe/classify models and the summarizer catalog live in
+code — `convex/models.ts` — and change via redeploy, not via commands:
 
 | Stage | Default | Notes |
 |---|---|---|
 | `transcribe` | `openai / whisper-1` | OpenAI only (OpenRouter has no audio endpoint). |
-| `classify` | `openai / gpt-4o-mini` | JSON-mode classifier that picks one of your types. |
-| `summarize` | `openai / gpt-4o-mini` | Runs your type's summary prompt. |
-
-Change them from inside Telegram:
-
-```
-/setmodel transcribe whisper-1
-/setmodel classify openrouter anthropic/claude-3.5-haiku
-/setmodel summarize openai gpt-4o
-```
+| `classify` | `openrouter / grok` | JSON-mode router + /summary filter agent. |
+| `summarize` | `openrouter / gemini` | Per-chat pick from the catalog via `/settings` → model (or `/modal`). |
 
 Any stage pointed at `openrouter` requires `OPENROUTER_API_KEY` to be set in
 `.env.local` and re-pushed with `npm run setup`.

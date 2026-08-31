@@ -43,21 +43,41 @@ async function rawTelegramMethod<T>(
   return json.result as T;
 }
 
-// Inline-keyboard rows. Each entry is either a callback button (data is
-// returned in callback_query.data) or a URL button (Telegram opens it
-// directly — useful for deep-linking back into the bot's DM).
+// Inline-keyboard rows. Each entry is a callback button (data is returned
+// in callback_query.data), a URL button, or a disabled button (Bot API
+// 10.3 — renders as an inert grey button, used for section labels and
+// already-active options). All variants accept the Bot API 9.4 styling
+// fields: `style` colors the button, `icon_custom_emoji_id` shows a custom
+// emoji before the text (requires bot-owner Premium or a Fragment
+// username, so use sparingly).
+export type InlineButtonStyle = "primary" | "success" | "danger";
+interface InlineButtonBase {
+  text: string;
+  style?: InlineButtonStyle;
+  icon_custom_emoji_id?: string;
+}
 export type InlineButton =
-  | { text: string; callback_data: string }
-  | { text: string; url: string };
+  | (InlineButtonBase & { callback_data: string })
+  | (InlineButtonBase & { url: string })
+  | (InlineButtonBase & { disabled: Record<string, never> });
 export type InlineKeyboard = InlineButton[][];
 
 interface SendOpts {
   replyToMessageId?: number;
+  // External reply (Bot API 7.0): reply to a message living in ANOTHER
+  // chat — the sent message gets a tappable quote header linking there.
+  // Only meaningful together with replyToMessageId. Unlike same-chat
+  // replies there is no allow_sending_without_reply escape hatch, so the
+  // send FAILS if the target can't be referenced — callers must catch and
+  // fall back to a plain send.
+  replyToChatId?: number;
   parseMode?: ParseMode;
   inlineKeyboard?: InlineKeyboard;
 }
 
-function buildReplyMarkup(keyboard: InlineKeyboard | undefined) {
+// grammY's types don't know about style/icon/disabled yet, so the markup
+// object is typed loosely on purpose.
+function buildReplyMarkup(keyboard: InlineKeyboard | undefined): any {
   if (!keyboard) return undefined;
   return { inline_keyboard: keyboard };
 }
@@ -73,7 +93,11 @@ export async function sendMessage(
       ? {
           reply_parameters: {
             message_id: opts.replyToMessageId,
-            allow_sending_without_reply: true,
+            ...(opts.replyToChatId !== undefined
+              ? // Cross-chat reply: allow_sending_without_reply is always
+                // False for these per the API, so don't send it.
+                { chat_id: opts.replyToChatId }
+              : { allow_sending_without_reply: true }),
           },
         }
       : {}),
@@ -204,29 +228,46 @@ export async function editGuestMessageText(
 
 // ---- Reactions (Bot API 7.0+) ---------------------------------------------
 
-// Sets (or clears, with no emoji) the bot's reaction on a message. Bots
-// get one reaction from the fixed emoji set. Used in quiet mode to signal
-// "processed — react to get the summary".
+export interface ReactionSpec {
+  type: "emoji" | "custom_emoji";
+  value: string; // emoji char or custom_emoji_id
+}
+
+// Sets (or clears, when reaction is omitted) the bot's reaction on a
+// message. Bots get one reaction per message. Plain emoji must be from
+// Telegram's allowed reaction set; custom emoji work when the chat allows
+// them (or the reaction is already present on the message). Note that
+// automatically forwarded channel posts inherit the CHANNEL's allowed
+// reactions, so this can legitimately fail there — callers treat that as
+// soft. Returns whether Telegram accepted the reaction.
 export async function setMessageReaction(
   chatId: number,
   messageId: number,
-  emoji?: string,
-): Promise<void> {
+  reaction?: ReactionSpec,
+): Promise<boolean> {
   try {
     await rawTelegramMethod("setMessageReaction", {
       chat_id: chatId,
       message_id: messageId,
-      reaction: emoji ? [{ type: "emoji", emoji }] : [],
+      reaction: reaction
+        ? [
+            reaction.type === "emoji"
+              ? { type: "emoji", emoji: reaction.value }
+              : { type: "custom_emoji", custom_emoji_id: reaction.value },
+          ]
+        : [],
     });
+    return true;
   } catch (err) {
     console.warn(
       "setMessageReaction failed",
       err instanceof Error ? err.message : String(err),
     );
+    return false;
   }
 }
 
-// ---- Ephemeral messages (Bot API 10.2) ------------------------------------
+// ---- Ephemeral messages (Bot API 10.2, params updated in 10.3) ------------
 
 // Sends a message visible only to `receiverUserId` in a group chat.
 // Conditions (per Bot API docs):
@@ -236,12 +277,22 @@ export async function setMessageReaction(
 // Ephemeral messages have message_id 0; the real handle is
 // ephemeral_message_id. Returns null on failure so callers can fall back
 // to a regular send.
+//
+// IMPORTANT: Bot API 10.3 (2026-08-24) REMOVED the top-level
+// receiver_user_id / callback_query_id parameters in favor of the
+// ephemeral_message_parameters object. With the old parameters Telegram
+// silently ignores the unknown fields and the "ephemeral" message goes out
+// as a regular public message — that's the regression that broke the
+// reaction → ephemeral-summary flow.
 export async function sendEphemeralMessage(
   chatId: number,
   receiverUserId: number,
   text: string,
   opts: {
     callbackQueryId?: string;
+    // Show the ephemeral message in place of the callback's source
+    // message (only valid for callbacks from regular messages).
+    replaceCallbackQueryMessage?: boolean;
     replyToEphemeralMessageId?: number;
     parseMode?: ParseMode;
     inlineKeyboard?: InlineKeyboard;
@@ -253,12 +304,17 @@ export async function sendEphemeralMessage(
       ephemeral_message_id?: number;
     }>("sendMessage", {
       chat_id: chatId,
-      receiver_user_id: receiverUserId,
+      ephemeral_message_parameters: {
+        receiver_user_id: receiverUserId,
+        ...(opts.callbackQueryId
+          ? { callback_query_id: opts.callbackQueryId }
+          : {}),
+        ...(opts.replaceCallbackQueryMessage
+          ? { replace_callback_query_message: true }
+          : {}),
+      },
       text,
       link_preview_options: { is_disabled: true },
-      ...(opts.callbackQueryId
-        ? { callback_query_id: opts.callbackQueryId }
-        : {}),
       ...(opts.replyToEphemeralMessageId !== undefined
         ? {
             reply_parameters: {
@@ -341,6 +397,35 @@ export async function setMyCommands(
   await rawTelegramMethod("setMyCommands", { commands });
 }
 
+// ---- Business mode (Bot API 7.2+) -----------------------------------------
+
+// Sends a message INTO a managed private conversation on behalf of the
+// connected business account (the peer sees it as coming from the owner,
+// with the bot badge). Used for the per-conversation "auto-send transcript
+// of my outgoing voices" toggle.
+export async function sendBusinessMessage(
+  businessConnectionId: string,
+  chatId: number,
+  text: string,
+  opts: { replyToMessageId?: number; parseMode?: ParseMode } = {},
+): Promise<{ message_id: number }> {
+  return await rawTelegramMethod("sendMessage", {
+    business_connection_id: businessConnectionId,
+    chat_id: chatId,
+    text,
+    link_preview_options: { is_disabled: true },
+    ...(opts.replyToMessageId !== undefined
+      ? {
+          reply_parameters: {
+            message_id: opts.replyToMessageId,
+            allow_sending_without_reply: true,
+          },
+        }
+      : {}),
+    ...(opts.parseMode ? { parse_mode: opts.parseMode } : {}),
+  });
+}
+
 // "typing…" indicator while the Q&A model thinks.
 export async function sendChatAction(
   chatId: number,
@@ -368,11 +453,20 @@ export const RICH_TEXT_LIMIT = 32000;
 export async function sendRichMarkdownMessage(
   chatId: number,
   markdown: string,
-  opts: { replyToMessageId?: number; inlineKeyboard?: InlineKeyboard } = {},
+  opts: {
+    replyToMessageId?: number;
+    inlineKeyboard?: InlineKeyboard;
+    // Send on behalf of a connected business account (works only if the
+    // account itself can send rich messages).
+    businessConnectionId?: string;
+  } = {},
 ): Promise<{ message_id: number }> {
   return await rawTelegramMethod("sendRichMessage", {
     chat_id: chatId,
     rich_message: { markdown },
+    ...(opts.businessConnectionId
+      ? { business_connection_id: opts.businessConnectionId }
+      : {}),
     ...(opts.replyToMessageId !== undefined
       ? {
           reply_parameters: {

@@ -65,6 +65,22 @@ export default defineSchema({
     // message during processing. The pipeline checks this between
     // stages and bails out without further edits/sends.
     cancelled: v.optional(v.boolean()),
+    // Delivery plan resolved at ingest time (chat settings + sender kind):
+    //   "instant"       — placeholder → final summary (classic);
+    //   "instantSilent" — no placeholder, trigger reaction while
+    //                     processing, summary posted as a reply;
+    //   "onDemand"      — nothing public; trigger reaction when the
+    //                     transcript is ready, summary served ephemerally.
+    // A bot-mention reply to the voice upgrades this to "instant"
+    // mid-flight; the pipeline re-reads it before committing. Absent on
+    // legacy rows → derived from chat settings.
+    delivery: v.optional(
+      v.union(
+        v.literal("instant"),
+        v.literal("instantSilent"),
+        v.literal("onDemand"),
+      ),
+    ),
     // The bot's reply message in the source chat. Instantly posted as
     // "Обрабатываю…", then edited with progress and the final summary.
     ackMessageId: v.optional(v.number()),
@@ -73,6 +89,20 @@ export default defineSchema({
     // customer-facing dialog.
     businessConnectionId: v.optional(v.string()),
     businessUserChatId: v.optional(v.number()),
+    // True when the business voice was SENT by the account owner (as
+    // opposed to received from the peer). Outgoing voices can be
+    // auto-transcribed into the managed chat for the peer when the
+    // conversation's autoSendTranscript toggle is on.
+    businessOutgoing: v.optional(v.boolean()),
+    // "Отправить собеседнику" pressed while the voice was still
+    // processing: the pipeline claims this flag (atomically, via
+    // claimBusinessSend) once the summary is ready and delivers it to the
+    // peer.
+    businessSendQueued: v.optional(v.boolean()),
+    // Set once the summary has actually been delivered to the peer (by
+    // the button, the queued press, or the auto-send toggle). Doubles as
+    // the de-duplication guard — claimBusinessSend refuses a second send.
+    businessSentAt: v.optional(v.number()),
     timings: v.optional(
       v.object({
         transcribeMs: v.optional(v.number()),
@@ -106,7 +136,26 @@ export default defineSchema({
     rights: v.optional(v.any()),
     connectedAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_connection", ["connectionId"]),
+  })
+    .index("by_connection", ["connectionId"])
+    .index("by_user", ["userId"]),
+
+  // Per-conversation settings for Telegram Business mode (the bot manages
+  // the owner's personal account). One row per (connection, peer chat),
+  // materialized the first time a voice from that conversation is seen so
+  // the owner's DM /settings panel can list conversations with toggles.
+  businessChatSettings: defineTable({
+    connectionId: v.string(),
+    peerChatId: v.number(),
+    peerName: v.optional(v.string()),
+    // When the OWNER sends a voice in this conversation, post its
+    // transcript into the conversation (visible to the peer, sent from
+    // the owner's account) right after transcription. Default off.
+    autoSendTranscript: v.optional(v.boolean()),
+    lastSeenAt: v.number(),
+  })
+    .index("by_connection_peer", ["connectionId", "peerChatId"])
+    .index("by_connection_seen", ["connectionId", "lastSeenAt"]),
 
   // Summary cache — one row per unique (voice, mode, context, detail)
   // combination. Mode and context are always concrete keys (never "auto")
@@ -135,11 +184,46 @@ export default defineSchema({
     // Summarizer model KEY from models.SUMMARIZE_MODEL_OPTIONS ("gemini" /
     // "grok"), toggled via /modal. Absent → default key.
     summarizeModel: v.optional(v.string()),
-    // Quiet mode (/quiet): the bot doesn't post summaries publicly;
-    // instead a reaction on a voice message gets the reactor an ephemeral
-    // summary. Requires the bot to be a chat admin (both for reaction
-    // updates and for at-will ephemeral sends).
+    // How the bot answers voices from regular members (/settings):
+    //   "instant"  — post a loading placeholder, edit it into the summary
+    //                (classic behavior, the default);
+    //   "onDemand" — post nothing; mark the processed voice with the
+    //                trigger reaction, serve the summary ephemerally to
+    //                whoever reacts with that reaction. Requires the bot
+    //                to be a chat admin.
+    deliveryMode: v.optional(
+      v.union(v.literal("instant"), v.literal("onDemand")),
+    ),
+    // Instant mode only: skip the "Обрабатываю…" placeholder — react with
+    // the trigger reaction on receipt and post the summary when ready.
+    skipLoadingMessage: v.optional(v.boolean()),
+    // Voices posted on behalf of a channel (channel posts auto-forwarded
+    // into the linked discussion group, and messages sent with the channel
+    // identity) are always processed in instant mode with a placeholder,
+    // regardless of deliveryMode. Default true.
+    channelVoicesInstant: v.optional(v.boolean()),
+    // Trigger reaction for on-demand mode ( /reaction ). Either a plain
+    // emoji from Telegram's allowed reaction set or a custom (premium)
+    // emoji id. Absent → 👀.
+    reactionType: v.optional(
+      v.union(v.literal("emoji"), v.literal("custom_emoji")),
+    ),
+    reactionValue: v.optional(v.string()),
+    // Human-readable form of a custom_emoji reaction (the emoji char the
+    // custom emoji is based on) for menus/messages.
+    reactionDisplay: v.optional(v.string()),
+    // Business mode, stored on the OWNER's DM chat row: include the raw
+    // transcript (as a second collapsed block) when sending a voice
+    // summary to the peer — both auto-send and the manual button.
+    // Default off: only the summary goes out.
+    businessIncludeTranscript: v.optional(v.boolean()),
+    // === LEGACY ===
+    // Pre-/settings quiet mode flag. Read only as a fallback when
+    // deliveryMode is absent (quietMode=true → "onDemand"). New code
+    // writes deliveryMode.
     quietMode: v.optional(v.boolean()),
+    // Ancient pre-history field still present on some rows; never read.
+    showTranscript: v.optional(v.boolean()),
   }).index("by_chat", ["chatId"]),
 
   // Per-chat nickname overrides. When set, the bot uses this name instead

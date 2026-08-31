@@ -22,6 +22,8 @@ import {
   renderChatSummaryFinal,
   renderFinal,
   resolveVoiceSettings,
+  businessSendButton,
+  sendBusinessSummary,
 } from "./processing";
 import {
   ALL_CONTEXT_KEYS,
@@ -45,6 +47,7 @@ import {
 import {
   answerGuestQuery,
   answerCallbackQuery,
+  deleteEphemeralMessage,
   deleteMessage,
   downloadFile,
   editEphemeralMessageText,
@@ -58,11 +61,13 @@ import {
   resolveMessageLinks,
   sendEphemeralMessage,
   sendMessage,
+  setMessageReaction,
   splitHtmlSafely,
   splitTextSafely,
   TG_TEXT_LIMIT,
   type InlineKeyboard,
 } from "./telegram";
+import type { ResolvedChatSettings } from "./chatSettings";
 
 // Minimal Telegram update typing — only the fields we read.
 type TgUser = {
@@ -71,7 +76,15 @@ type TgUser = {
   last_name?: string;
   username?: string;
 };
-type TgChat = { id: number; type: string; title?: string; username?: string };
+type TgChat = {
+  id: number;
+  type: string;
+  title?: string;
+  username?: string;
+  // Private chats (incl. business-managed conversations).
+  first_name?: string;
+  last_name?: string;
+};
 type TgBusinessConnection = {
   id: string;
   user?: TgUser;
@@ -92,6 +105,12 @@ type TgDocument = {
   file_size?: number;
 };
 type TgSticker = { file_id: string };
+type TgEntity = {
+  type: string;
+  offset: number;
+  length: number;
+  custom_emoji_id?: string;
+};
 type TgMessage = {
   message_id: number;
   date?: number;
@@ -103,9 +122,15 @@ type TgMessage = {
   // Such messages have message_id 0 and are invisible in the chat.
   ephemeral_message_id?: number;
   from?: TgUser;
+  // Set when the message is sent on behalf of a chat: channel-identity
+  // messages in the discussion group and (with is_automatic_forward)
+  // channel posts auto-forwarded there.
+  sender_chat?: TgChat;
+  is_automatic_forward?: boolean;
   chat: TgChat;
   text?: string;
   caption?: string;
+  entities?: TgEntity[];
   voice?: TgVoice;
   audio?: TgAudio;
   video_note?: TgVideoNote;
@@ -114,6 +139,9 @@ type TgMessage = {
   document?: TgDocument;
   sticker?: TgSticker;
   reply_to_message?: TgMessage;
+  reply_markup?: {
+    inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>>;
+  };
 };
 type TgCallbackQuery = {
   id: string;
@@ -121,13 +149,18 @@ type TgCallbackQuery = {
   message?: TgMessage;
   data?: string;
 };
+type TgReactionType = {
+  type: string; // "emoji" | "custom_emoji" | "paid"
+  emoji?: string;
+  custom_emoji_id?: string;
+};
 type TgMessageReaction = {
   chat: TgChat;
   message_id: number;
   user?: TgUser;
   date?: number;
-  old_reaction?: unknown[];
-  new_reaction?: unknown[];
+  old_reaction?: TgReactionType[];
+  new_reaction?: TgReactionType[];
 };
 type TgUpdate = {
   update_id: number;
@@ -164,6 +197,8 @@ function getAllowedChatIds(): Set<number> | null {
 
 const HELP_TEXT = `Команды админа:
 
+/settings — настройки бота: в группе — режим ответа/реакция/модель, в личке — бизнес-переписки и дефолты
+/reaction <эмодзи> — сменить реакцию-триггер режима «по требованию»
 /defaults — показать/изменить дефолтные настройки summary для этого чата
 /debug [on|off] — дебаг-режим
 /whoami — ваш Telegram ID и ID этого чата
@@ -171,12 +206,14 @@ const HELP_TEXT = `Команды админа:
 /search <запрос> — найти сообщения в истории чата по смыслу
 /ask <вопрос> — коротко ответить на вопрос по истории чата с доказательными ссылками
 /modal — выбрать модель суммаризации для чата (эфемерный переключатель)
-/quiet — тихий режим: summary не постятся, реакция на войс присылает их эфемерно
+/quiet — переключить режим «по требованию» (алиас для /settings)
 /importdump — загрузить Telegram JSON export (result.json) и проиндексировать историю
 /indexstats — статистика покрытия БД и векторного индекса для этого чата
 /indexstats rebuild — пересобрать сохранённые счётчики
 /reindex — переиндексировать сохранённые сообщения этого чата
 /help — это сообщение
+
+Тег бота ответом на голосовое в любом режиме постит его расшифровку в чат.
 
 Стили, контексты, уровни детальности и LLM-модели заданы в коде:
   convex/prompts.ts — стили / контексты / промты
@@ -304,9 +341,26 @@ export const handleUpdate = internalAction({
       return;
     }
 
-    // 3a-bis. /modal — per-chat summarizer model toggle, /quiet — quiet
-    // mode. Both registered as ephemeral commands (invisible in chat);
-    // any group member can use them.
+    // 3a-bis. Chat-settings commands. All registered as ephemeral commands
+    // (invisible in chat); any group member can use them. /modal and
+    // /quiet are legacy aliases for parts of /settings. In the bot's DM
+    // /settings opens the private-mode panel (business conversations +
+    // personal defaults).
+    if (/^\/settings(?:@[\w_]+)?(?:\s|$)/i.test(commandText)) {
+      if (isPrivateChat) {
+        await handleDmSettingsCommand(ctx, message);
+      } else {
+        await handleSettingsCommand(ctx, message);
+      }
+      return;
+    }
+    if (
+      !isPrivateChat &&
+      /^\/reaction(?:@[\w_]+)?(?:\s|$)/i.test(commandText)
+    ) {
+      await handleReactionCommand(ctx, message, commandText);
+      return;
+    }
     if (!isPrivateChat && /^\/modal(?:@[\w_]+)?(?:\s|$)/i.test(commandText)) {
       await handleModalCommand(ctx, message);
       return;
@@ -364,7 +418,20 @@ export const handleUpdate = internalAction({
       return;
     }
 
-    // 3c. Reply-to-summary Q&A — any group member replying (plain text,
+    // 3c. Bot mention replying to a voice — ALWAYS answers with a public
+    // transcription/summary of that voice, regardless of the chat's
+    // delivery mode. (When the bot is not in the chat, the same summon
+    // arrives as a guest_message and is handled above.)
+    if (!isPrivateChat && message.reply_to_message) {
+      const handledMention = await maybeHandleVoiceMentionSummon(
+        ctx,
+        message,
+        commandText,
+      );
+      if (handledMention) return;
+    }
+
+    // 3d. Reply-to-summary Q&A — any group member replying (plain text,
     // not a command) to one of the bot's summary or Q&A messages gets an
     // answer grounded in the summary + full transcript/log.
     if (
@@ -447,6 +514,15 @@ async function handleBusinessConnection(
   });
 }
 
+// Human-readable name of the peer in a managed private conversation.
+function businessPeerName(chat: TgChat): string | undefined {
+  return (
+    [chat.first_name, chat.last_name].filter(Boolean).join(" ") ||
+    chat.title ||
+    (chat.username ? `@${chat.username}` : undefined)
+  );
+}
+
 async function handleBusinessMessage(
   ctx: { runMutation: any; runQuery: any; scheduler: any },
   message: TgMessage,
@@ -457,9 +533,24 @@ async function handleBusinessMessage(
     connectionId: message.business_connection_id,
   });
   if (!connection || !connection.isEnabled) return;
+
+  // Direction: the owner's own voices are "outgoing" (they can be
+  // auto-transcribed into the conversation for the peer); everything else
+  // is incoming from the peer.
+  const outgoing = message.from?.id === connection.userId;
+
+  // Materialize/refresh the conversation row so the owner's DM /settings
+  // panel lists it with its toggle.
+  await ctx.runMutation(internal.businessChatSettings.upsertSeen, {
+    connectionId: message.business_connection_id,
+    peerChatId: message.chat.id,
+    peerName: businessPeerName(message.chat),
+  });
+
   await handleVoice(ctx, message, media, {
     businessConnectionId: message.business_connection_id,
     businessUserChatId: connection.userChatId,
+    businessOutgoing: outgoing,
     privateResult: true,
   });
 }
@@ -858,6 +949,18 @@ function buildGuestTextBody(text: string, title: string): string {
   return `<b>${escapedTitle}</b>\n\n<blockquote expandable>${escapeHtml(clipped)}</blockquote>`;
 }
 
+type VoiceDelivery = "instant" | "instantSilent" | "onDemand";
+
+// True for messages that carry a channel identity: channel posts
+// auto-forwarded into the linked discussion group, and messages sent into
+// the group "as the channel".
+function isChannelSenderMessage(message: TgMessage): boolean {
+  return (
+    message.is_automatic_forward === true ||
+    message.sender_chat?.type === "channel"
+  );
+}
+
 async function handleVoice(
   ctx: { runMutation: any; runQuery: any; scheduler: any },
   message: TgMessage,
@@ -865,7 +968,11 @@ async function handleVoice(
   opts: {
     businessConnectionId?: string;
     businessUserChatId?: number;
+    businessOutgoing?: boolean;
     privateResult?: boolean;
+    // Bot-mention summon: always answer publicly with a placeholder, no
+    // matter what the chat's delivery mode says.
+    forceInstant?: boolean;
   } = {},
 ) {
   const existing = await ctx.runQuery(internal.voiceMessages.findByMessage, {
@@ -882,33 +989,92 @@ async function handleVoice(
       .filter(Boolean)
       .join(" ") || undefined;
 
-  let ackMessageId: number | undefined;
   const ackChatId = opts.privateResult
     ? opts.businessUserChatId
     : message.chat.id;
-  // Quiet mode: no public "Обрабатываю…" placeholder in groups — the
-  // pipeline runs silently and reactions serve the result ephemerally.
-  let quiet = false;
-  if (!opts.privateResult && message.chat.type !== "private") {
+
+  // Resolve the delivery plan for this specific voice.
+  const isGroup = !opts.privateResult && message.chat.type !== "private";
+  let delivery: VoiceDelivery = "instant";
+  let triggerReaction: { type: "emoji" | "custom_emoji"; value: string } = {
+    type: "emoji",
+    value: "👀",
+  };
+  if (isGroup) {
     const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
       chatId: message.chat.id,
     });
-    quiet = settings.quietMode;
+    triggerReaction = {
+      type: settings.reaction.type,
+      value: settings.reaction.value,
+    };
+    if (opts.forceInstant) {
+      delivery = "instant";
+    } else if (isChannelSenderMessage(message)) {
+      // Channel voices: always instant with a visible placeholder (when
+      // the toggle is on) — the on-demand and silent modes don't apply to
+      // channel posts / channel-identity voices.
+      delivery = settings.channelVoicesInstant
+        ? "instant"
+        : settings.deliveryMode === "onDemand"
+          ? "onDemand"
+          : settings.skipLoadingMessage
+            ? "instantSilent"
+            : "instant";
+    } else if (settings.deliveryMode === "onDemand") {
+      delivery = "onDemand";
+    } else if (settings.skipLoadingMessage) {
+      delivery = "instantSilent";
+    }
   }
-  if (ackChatId !== undefined && !quiet) {
+
+  let ackMessageId: number | undefined;
+  if (ackChatId !== undefined && delivery === "instant") {
+    const label = opts.privateResult
+      ? "Обрабатываю голосовое из личной переписки…"
+      : media.kind === "video_note"
+        ? "Обрабатываю видеокружок…"
+        : media.kind === "audio"
+          ? "Обрабатываю аудио…"
+          : "Обрабатываю голосовое…";
+    const ackText = `${loadingEmoji()}  <i>${escapeHtml(label)}</i>`;
     try {
-      const ack = await sendMessage(
-        ackChatId,
-        `${loadingEmoji()}  <i>Обрабатываю голосовое из личной переписки…</i>`,
-        {
-          replyToMessageId: opts.privateResult ? undefined : message.message_id,
+      if (opts.privateResult) {
+        // Business voices: the placeholder lands in the OWNER's DM, but as
+        // an EXTERNAL reply to the voice in the managed conversation — the
+        // quote header is a one-tap jump into that dialog. Cross-chat
+        // replies can't fall back automatically, so retry plain on error.
+        let ack: { message_id: number };
+        try {
+          ack = await sendMessage(ackChatId, ackText, {
+            replyToChatId: message.chat.id,
+            replyToMessageId: message.message_id,
+            parseMode: "HTML",
+          });
+        } catch {
+          ack = await sendMessage(ackChatId, ackText, { parseMode: "HTML" });
+        }
+        ackMessageId = ack.message_id;
+      } else {
+        const ack = await sendMessage(ackChatId, ackText, {
+          replyToMessageId: message.message_id,
           parseMode: "HTML",
-        },
-      );
-      ackMessageId = ack.message_id;
+        });
+        ackMessageId = ack.message_id;
+      }
     } catch (err) {
       console.warn("Failed to send ack placeholder", err);
     }
+  }
+
+  // Silent-instant: the trigger reaction doubles as the "seen, working on
+  // it" indicator — up immediately, cleared when the summary is posted.
+  if (delivery === "instantSilent") {
+    await setMessageReaction(
+      message.chat.id,
+      message.message_id,
+      triggerReaction,
+    );
   }
 
   const id = await ctx.runMutation(internal.voiceMessages.create, {
@@ -923,6 +1089,8 @@ async function handleVoice(
     ackMessageId,
     businessConnectionId: opts.businessConnectionId,
     businessUserChatId: opts.businessUserChatId,
+    businessOutgoing: opts.businessOutgoing,
+    delivery,
   });
   // Pull the freshly-generated shortId and link it back to the chat-log
   // row so /summary can splice the transcript in later.
@@ -1177,7 +1345,7 @@ async function handleModalCallback(
   }
 }
 
-// ---- /quiet: quiet mode toggle --------------------------------------------
+// ---- /quiet: legacy alias for the on-demand delivery mode -----------------
 
 async function handleQuietCommand(
   ctx: { runMutation: any; runQuery: any },
@@ -1190,9 +1358,12 @@ async function handleQuietCommand(
     internal.chatSettings.toggleQuietMode,
     { chatId },
   );
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  })) as ResolvedChatSettings;
   const text = enabled
-    ? "🤫 Тихий режим включён. Summary больше не постятся в чат: обработанное голосовое бот помечает реакцией 👀, а ваша реакция на голосовое присылает вам summary эфемерно — видно только вам. Для реакций и эфемерных сообщений бот должен быть админом чата."
-    : "🔊 Тихий режим выключен — summary снова постятся в чат.";
+    ? `👀 Режим «по требованию» включён. Summary больше не постятся в чат: обработанное голосовое бот помечает реакцией ${settings.reaction.display}, а ваша такая же реакция на голосовое присылает вам расшифровку эфемерно — видно только вам. Тег бота ответом на голосовое всё равно постит расшифровку публично. Подробнее: /settings`
+    : "📨 Режим «по требованию» выключен — summary снова постятся в чат. Подробнее: /settings";
   const eph = await sendEphemeralMessage(chatId, userId, text, {
     replyToEphemeralMessageId: message.ephemeral_message_id,
   });
@@ -1203,7 +1374,1030 @@ async function handleQuietCommand(
   }
 }
 
-// ---- Reactions → ephemeral summary (quiet mode) ---------------------------
+// ---- /settings: chat settings panel (Bot API 9.4/10.3 styled buttons) -----
+
+type SettingsView =
+  | "main"
+  | "delivery"
+  | "reaction"
+  | "model"
+  | "defMode"
+  | "defContext"
+  | "defDetail";
+
+// Preset trigger reactions offered in the menu. All are from Telegram's
+// allowed plain-reaction set; anything else (incl. premium custom emoji)
+// goes through /reaction.
+const REACTION_PRESETS = ["👀", "✍", "👍", "🔥", "⚡", "💯", "🎉", "🤝"];
+
+// Telegram's fixed set of plain-emoji reactions (Bot API ReactionTypeEmoji).
+// A plain reaction outside this set is a hard 400 from setMessageReaction.
+const ALLOWED_REACTION_EMOJI = new Set([
+  "👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢",
+  "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳",
+  "❤‍🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓",
+  "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈",
+  "😇", "😨", "🤝", "✍", "🤗", "🫡", "🎅", "🎄", "☃", "💅", "🤪", "🗿",
+  "🆒", "💘", "🙉", "🦄", "😘", "💊", "🙊", "😎", "👾", "🤷‍♂", "🤷", "🤷‍♀",
+  "😡",
+]);
+
+function deliveryModeLabel(s: ResolvedChatSettings): string {
+  return s.deliveryMode === "onDemand" ? "По требованию" : "Сразу в чат";
+}
+
+function settingsCb(chatId: number, ephId: number, op: string): string {
+  return `st:${chatId}:${ephId}:${op}`;
+}
+
+function renderSettingsText(
+  view: SettingsView,
+  s: ResolvedChatSettings,
+): string {
+  const header = `<b>⚙️ Настройки бота в этом чате</b>`;
+  switch (view) {
+    case "delivery":
+      return (
+        `${header}\n\n<b>Режим ответа на голосовые</b>\n\n` +
+        `📨 <b>Сразу в чат</b> — бот отвечает на голосовое сообщением с загрузкой и превращает его в summary. Классика.\n\n` +
+        `👀 <b>По требованию</b> — бот ничего не постит. Когда расшифровка готова, он ставит на голосовое реакцию ${escapeHtml(s.reaction.display)}. Поставьте такую же реакцию — и получите расшифровку эфемерным сообщением, которое видите только вы.\n\n` +
+        `Для режима «по требованию» бот должен быть <b>админом чата</b> (реакции и эфемерные сообщения), а реакция ${escapeHtml(s.reaction.display)} — разрешена в чате.\n\n` +
+        `В любом режиме: тег бота ответом на голосовое постит его расшифровку публично. Войсы от имени канала управляются отдельной настройкой.`
+      );
+    case "reaction":
+      return (
+        `${header}\n\n<b>Реакция-триггер</b>\n\nСейчас: ${escapeHtml(s.reaction.display)}${s.reaction.type === "custom_emoji" ? " (премиум-эмодзи)" : ""}\n\n` +
+        `Этой реакцией бот помечает обработанные голосовые в режиме «по требованию», и её же ставят участники, чтобы получить расшифровку.\n\n` +
+        `Любую другую реакцию (включая премиум) можно задать командой:\n<code>/reaction &lt;эмодзи&gt;</code>\n\n` +
+        `Реакция должна быть разрешена в настройках чата, иначе Telegram не даст её поставить.`
+      );
+    case "model":
+      return `${header}\n\n<b>Модель суммаризации</b>\n\nКакая LLM пишет summary в этом чате.`;
+    case "defMode":
+      return `${header}\n\n<b>Стиль summary по умолчанию</b>\n\n«Авто» — роутер выбирает стиль по содержанию голосового.`;
+    case "defContext":
+      return `${header}\n\n<b>Контекст по умолчанию</b>\n\n«Авто» — роутер определяет контекст по содержанию.`;
+    case "defDetail":
+      return `${header}\n\n<b>Детальность по умолчанию</b>\n\n1 — кратко, 3 — подробно.`;
+    default: {
+      const lines = [
+        header,
+        "",
+        `📬 Режим: <b>${deliveryModeLabel(s)}</b>`,
+        s.deliveryMode === "onDemand"
+          ? `— бот помечает готовые голосовые реакцией ${escapeHtml(s.reaction.display)}; такая же реакция участника присылает ему расшифровку эфемерно.`
+          : s.skipLoadingMessage
+            ? `— без сообщения о загрузке: бот ставит ${escapeHtml(s.reaction.display)} пока обрабатывает и постит готовый summary.`
+            : `— бот отвечает сообщением с загрузкой и превращает его в summary.`,
+        `📣 Войсы от имени канала: <b>${s.channelVoicesInstant ? "всегда сразу в чат" : "по общему режиму"}</b>`,
+        `🧠 Модель: <b>${escapeHtml(SUMMARIZE_MODEL_OPTIONS[s.summarizeModelKey].label)}</b>`,
+        "",
+        `Тег бота ответом на голосовое в любом режиме постит расшифровку публично.`,
+      ];
+      return lines.join("\n");
+    }
+  }
+}
+
+function buildSettingsKeyboard(
+  view: SettingsView,
+  s: ResolvedChatSettings,
+  chatId: number,
+  ephId: number,
+): InlineKeyboard {
+  const cb = (op: string) => settingsCb(chatId, ephId, op);
+  const backRow = [{ text: "← Назад", callback_data: cb("m") }];
+
+  if (view === "delivery") {
+    const active = s.deliveryMode;
+    return [
+      [
+        active === "instant"
+          ? { text: "✓ 📨 Сразу в чат", style: "success" as const, disabled: {} }
+          : { text: "📨 Сразу в чат", callback_data: cb("di") },
+      ],
+      [
+        active === "onDemand"
+          ? {
+              text: `✓ ${s.reaction.display} По требованию`,
+              style: "success" as const,
+              disabled: {},
+            }
+          : {
+              text: `${s.reaction.display} По требованию`,
+              callback_data: cb("do"),
+            },
+      ],
+      backRow,
+    ];
+  }
+
+  if (view === "reaction") {
+    const rows: InlineKeyboard = [];
+    for (let i = 0; i < REACTION_PRESETS.length; i += 4) {
+      rows.push(
+        REACTION_PRESETS.slice(i, i + 4).map((emoji) =>
+          s.reaction.type === "emoji" && s.reaction.value === emoji
+            ? { text: `✓ ${emoji}`, style: "success" as const, disabled: {} }
+            : { text: emoji, callback_data: cb(`rs:${emoji}`) },
+        ),
+      );
+    }
+    rows.push(backRow);
+    return rows;
+  }
+
+  if (view === "model") {
+    const rows: InlineKeyboard = (
+      Object.keys(SUMMARIZE_MODEL_OPTIONS) as SummarizeModelKey[]
+    ).map((key) => [
+      key === s.summarizeModelKey
+        ? {
+            text: `✓ ${SUMMARIZE_MODEL_OPTIONS[key].label}`,
+            style: "success" as const,
+            disabled: {},
+          }
+        : {
+            text: SUMMARIZE_MODEL_OPTIONS[key].label,
+            callback_data: cb(`os:${key}`),
+          },
+    ]);
+    rows.push(backRow);
+    return rows;
+  }
+
+  if (view === "defMode" || view === "defContext") {
+    const keys: readonly string[] =
+      view === "defMode" ? ALL_MODE_KEYS : ALL_CONTEXT_KEYS;
+    const label = view === "defMode" ? modeLabel : contextLabel;
+    const active = view === "defMode" ? s.mode : s.context;
+    const op = view === "defMode" ? "fms" : "fcs";
+    const rows: InlineKeyboard = [];
+    for (let i = 0; i < keys.length; i += 2) {
+      rows.push(
+        keys.slice(i, i + 2).map((k) =>
+          k === active
+            ? {
+                text: `✓ ${label(k as any)}`,
+                style: "success" as const,
+                disabled: {},
+              }
+            : { text: label(k as any), callback_data: cb(`${op}:${k}`) },
+        ),
+      );
+    }
+    rows.push(backRow);
+    return rows;
+  }
+
+  if (view === "defDetail") {
+    return [
+      ALL_DETAILS.map((d) =>
+        d === s.detail
+          ? { text: `✓ ${d}`, style: "success" as const, disabled: {} }
+          : { text: `${d}`, callback_data: cb(`fds:${d}`) },
+      ),
+      backRow,
+    ];
+  }
+
+  // Main view.
+  const isOnDemand = s.deliveryMode === "onDemand";
+  const rows: InlineKeyboard = [
+    [
+      {
+        text: `📬 Режим: ${deliveryModeLabel(s)}`,
+        style: "primary" as const,
+        callback_data: cb("d"),
+      },
+    ],
+    [
+      // The loading toggle only matters in instant mode — in on-demand
+      // it's inert, so render it as a disabled (grey) button.
+      isOnDemand
+        ? { text: "⏳ Загрузка: — (режим «по требованию»)", disabled: {} }
+        : s.skipLoadingMessage
+          ? { text: "⏳ Сообщение о загрузке: выкл", callback_data: cb("tl") }
+          : {
+              text: "⏳ Сообщение о загрузке: вкл",
+              style: "success" as const,
+              callback_data: cb("tl"),
+            },
+    ],
+    [
+      s.channelVoicesInstant
+        ? {
+            text: "📣 Войсы канала: всегда сразу",
+            style: "success" as const,
+            callback_data: cb("tc"),
+          }
+        : { text: "📣 Войсы канала: по общему режиму", callback_data: cb("tc") },
+    ],
+    [
+      { text: `Реакция: ${s.reaction.display}`, callback_data: cb("r") },
+      {
+        text: `🧠 ${SUMMARIZE_MODEL_OPTIONS[s.summarizeModelKey].label}`,
+        callback_data: cb("o"),
+      },
+    ],
+    [
+      { text: `📝 ${modeLabel(s.mode as any)}`, callback_data: cb("fm") },
+      { text: `🎭 ${contextLabel(s.context as any)}`, callback_data: cb("fc") },
+      { text: `📊 ${s.detail}`, callback_data: cb("fd") },
+    ],
+    [{ text: "✖️ Закрыть", style: "danger" as const, callback_data: cb("x") }],
+  ];
+  return rows;
+}
+
+async function handleSettingsCommand(
+  ctx: { runMutation: any; runQuery: any },
+  message: TgMessage,
+): Promise<void> {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  if (!userId) return;
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  })) as ResolvedChatSettings;
+  const text = renderSettingsText("main", settings);
+
+  // Ephemeral path: works when /settings came in as an ephemeral command
+  // (reply within 15s) or when the bot is a chat admin. The keyboard is
+  // sent twice — first with a placeholder ephemeral id, then re-issued
+  // with the real id baked into callback_data so button presses can edit
+  // the panel in place.
+  const eph = await sendEphemeralMessage(chatId, userId, text, {
+    parseMode: "HTML",
+    inlineKeyboard: buildSettingsKeyboard("main", settings, chatId, 0),
+    replyToEphemeralMessageId: message.ephemeral_message_id,
+  });
+  if (eph?.ephemeral_message_id) {
+    await editEphemeralMessageText(
+      chatId,
+      userId,
+      eph.ephemeral_message_id,
+      text,
+      {
+        parseMode: "HTML",
+        inlineKeyboard: buildSettingsKeyboard(
+          "main",
+          settings,
+          chatId,
+          eph.ephemeral_message_id,
+        ),
+      },
+    );
+    return;
+  }
+  if (!eph) {
+    await sendMessage(chatId, text, {
+      parseMode: "HTML",
+      inlineKeyboard: buildSettingsKeyboard("main", settings, chatId, 0),
+      replyToMessageId: message.message_id || undefined,
+    });
+  }
+}
+
+// st:<chatId>:<ephId>:<op>[:<value>]
+async function handleSettingsCallback(
+  ctx: { runMutation: any; runQuery: any },
+  cb: TgCallbackQuery,
+  parts: string[],
+): Promise<void> {
+  if (parts.length < 4) {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+  const chatId = Number(parts[1]);
+  const ephId = Number(parts[2]);
+  const op = parts[3];
+  const value = parts[4];
+  if (!Number.isFinite(chatId) || !Number.isFinite(ephId)) {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+
+  if (op === "x") {
+    await answerCallbackQuery(cb.id);
+    if (ephId) {
+      await deleteEphemeralMessage(chatId, cb.from.id, ephId);
+    } else if (cb.message) {
+      await deleteMessage(cb.message.chat.id, cb.message.message_id);
+    }
+    return;
+  }
+
+  let view: SettingsView = "main";
+  let toast: string | undefined;
+
+  switch (op) {
+    case "m":
+      view = "main";
+      break;
+    case "d":
+      view = "delivery";
+      break;
+    case "di":
+    case "do": {
+      const next = op === "di" ? "instant" : "onDemand";
+      await ctx.runMutation(internal.chatSettings.update, {
+        chatId,
+        deliveryMode: next,
+      });
+      toast =
+        next === "onDemand" ? "Режим: по требованию" : "Режим: сразу в чат";
+      view = "delivery";
+      break;
+    }
+    case "tl": {
+      const cur = (await ctx.runQuery(internal.chatSettings.getResolved, {
+        chatId,
+      })) as ResolvedChatSettings;
+      await ctx.runMutation(internal.chatSettings.update, {
+        chatId,
+        skipLoadingMessage: !cur.skipLoadingMessage,
+      });
+      toast = cur.skipLoadingMessage
+        ? "Сообщение о загрузке включено"
+        : "Сообщение о загрузке выключено — вместо него реакция";
+      view = "main";
+      break;
+    }
+    case "tc": {
+      const cur = (await ctx.runQuery(internal.chatSettings.getResolved, {
+        chatId,
+      })) as ResolvedChatSettings;
+      await ctx.runMutation(internal.chatSettings.update, {
+        chatId,
+        channelVoicesInstant: !cur.channelVoicesInstant,
+      });
+      toast = cur.channelVoicesInstant
+        ? "Войсы канала — по общему режиму"
+        : "Войсы канала — всегда сразу в чат";
+      view = "main";
+      break;
+    }
+    case "bi": {
+      const cur = (await ctx.runQuery(internal.chatSettings.getResolved, {
+        chatId,
+      })) as ResolvedChatSettings;
+      await ctx.runMutation(internal.chatSettings.update, {
+        chatId,
+        businessIncludeTranscript: !cur.businessIncludeTranscript,
+      });
+      toast = cur.businessIncludeTranscript
+        ? "Собеседнику — только summary"
+        : "Собеседнику — summary вместе с расшифровкой";
+      view = "main";
+      break;
+    }
+    case "r":
+      view = "reaction";
+      break;
+    case "rs": {
+      if (value && ALLOWED_REACTION_EMOJI.has(value)) {
+        await ctx.runMutation(internal.chatSettings.update, {
+          chatId,
+          reactionType: "emoji",
+          reactionValue: value,
+          reactionDisplay: value,
+        });
+        toast = `Реакция: ${value}`;
+      }
+      view = "reaction";
+      break;
+    }
+    case "o":
+      view = "model";
+      break;
+    case "os": {
+      if (value && isSummarizeModelKey(value)) {
+        await ctx.runMutation(internal.chatSettings.setSummarizeModel, {
+          chatId,
+          modelKey: value,
+        });
+        toast = `Модель: ${SUMMARIZE_MODEL_OPTIONS[value].label}`;
+      }
+      view = "model";
+      break;
+    }
+    case "fm":
+      view = "defMode";
+      break;
+    case "fms": {
+      if (value && isModeKey(value)) {
+        await ctx.runMutation(internal.chatSettings.update, {
+          chatId,
+          defaultMode: value,
+        });
+        toast = `Стиль: ${modeLabel(value)}`;
+      }
+      view = "defMode";
+      break;
+    }
+    case "fc":
+      view = "defContext";
+      break;
+    case "fcs": {
+      if (value && isContextKey(value)) {
+        await ctx.runMutation(internal.chatSettings.update, {
+          chatId,
+          defaultContext: value,
+        });
+        toast = `Контекст: ${contextLabel(value)}`;
+      }
+      view = "defContext";
+      break;
+    }
+    case "fd":
+      view = "defDetail";
+      break;
+    case "fds": {
+      const n = Number(value);
+      if (Number.isFinite(n) && isDetail(n)) {
+        await ctx.runMutation(internal.chatSettings.update, {
+          chatId,
+          defaultDetail: n,
+        });
+        toast = `Детальность: ${n}`;
+      }
+      view = "defDetail";
+      break;
+    }
+    default:
+      break;
+  }
+
+  await answerCallbackQuery(cb.id, toast);
+
+  // Private chats (positive ids) have their own main panel — the group
+  // main view is full of group-only toggles. Submenus (model, defaults)
+  // are shared between both panels.
+  const isPrivatePanel = chatId > 0;
+  let text: string;
+  let keyboard: InlineKeyboard;
+  if (isPrivatePanel && view === "main") {
+    const panel = await renderDmSettingsPanel(ctx, cb.from.id, chatId);
+    text = panel.text;
+    keyboard = panel.keyboard;
+  } else {
+    const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+      chatId,
+    })) as ResolvedChatSettings;
+    text = renderSettingsText(view, settings);
+    keyboard = buildSettingsKeyboard(view, settings, chatId, ephId);
+  }
+  if (ephId) {
+    await editEphemeralMessageText(chatId, cb.from.id, ephId, text, {
+      parseMode: "HTML",
+      inlineKeyboard: keyboard,
+    });
+  } else if (cb.message) {
+    await editMessageText(cb.message.chat.id, cb.message.message_id, text, {
+      parseMode: "HTML",
+      inlineKeyboard: keyboard,
+    });
+  }
+}
+
+// ---- DM /settings: private-mode panel (business + personal defaults) ------
+
+// The bot DM has no delivery modes or reactions — voices are always
+// answered instantly and everything is private already. What it does have:
+// the summarizer model + default style for the owner's voices (both DM and
+// business ones), and per-conversation toggles for Telegram Business mode.
+async function renderDmSettingsPanel(
+  ctx: { runQuery: any },
+  userId: number,
+  chatId: number,
+): Promise<{ text: string; keyboard: InlineKeyboard }> {
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  })) as ResolvedChatSettings;
+  const connection = await ctx.runQuery(
+    internal.businessConnections.findEnabledByUser,
+    { userId },
+  );
+  const conversations = connection
+    ? await ctx.runQuery(internal.businessChatSettings.listByConnection, {
+        connectionId: connection.connectionId,
+        limit: 15,
+      })
+    : [];
+
+  const lines: string[] = [
+    "<b>⚙️ Настройки в личке</b>",
+    "",
+    `🧠 Модель: <b>${escapeHtml(SUMMARIZE_MODEL_OPTIONS[settings.summarizeModelKey].label)}</b> · стиль/контекст/детали ниже — применяются к вашим войсам в личке и в бизнес-переписках.`,
+    "",
+  ];
+  if (!connection) {
+    lines.push(
+      "<i>Подключите бота как менеджера аккаунта (Telegram → Настройки → Telegram Business → Чат-боты), и здесь появятся ваши переписки.</i>",
+    );
+  } else if (conversations.length === 0) {
+    lines.push(
+      "<b>Переписки</b>",
+      "<i>Бот подключён к аккаунту. Как только в какой-нибудь переписке появится голосовое, она появится здесь со своими настройками.</i>",
+    );
+  } else {
+    lines.push(
+      "<b>Переписки</b>",
+      "📤 — summary вашего исходящего войса автоматически отправляется собеседнику в эту переписку (от имени вашего аккаунта). По умолчанию выключено; нажмите на переписку, чтобы переключить.",
+      "Без авто-отправки то же самое делается кнопкой «📤 Отправить собеседнику» под сообщением бота — её можно нажать сразу, не дожидаясь генерации: отправлю, как только summary будет готов.",
+      "Входящие войсы собеседников всегда расшифровываются сюда, в чат с ботом — Telegram не даёт показать расшифровку в самой переписке так, чтобы её не видел собеседник.",
+    );
+  }
+  lines.push(
+    "",
+    `📎 Собеседнику уходит: <b>${settings.businessIncludeTranscript ? "summary + расшифровка" : "только summary"}</b>`,
+  );
+
+  const keyboard: InlineKeyboard = [];
+  const cb = (op: string) => settingsCb(chatId, 0, op);
+  keyboard.push([
+    {
+      text: `🧠 ${SUMMARIZE_MODEL_OPTIONS[settings.summarizeModelKey].label}`,
+      callback_data: cb("o"),
+    },
+  ]);
+  keyboard.push([
+    { text: `📝 ${modeLabel(settings.mode as any)}`, callback_data: cb("fm") },
+    {
+      text: `🎭 ${contextLabel(settings.context as any)}`,
+      callback_data: cb("fc"),
+    },
+    { text: `📊 ${settings.detail}`, callback_data: cb("fd") },
+  ]);
+  keyboard.push([
+    settings.businessIncludeTranscript
+      ? {
+          text: "📎 Собеседнику: summary + расшифровка",
+          style: "success" as const,
+          callback_data: cb("bi"),
+        }
+      : { text: "📎 Собеседнику: только summary", callback_data: cb("bi") },
+  ]);
+  for (const conv of conversations) {
+    const name = conv.peerName ?? `чат ${conv.peerChatId}`;
+    const on = conv.autoSendTranscript === true;
+    keyboard.push([
+      {
+        text: on ? `📤 ${name} — авто-отправка` : `💤 ${name}`,
+        ...(on ? { style: "success" as const } : {}),
+        callback_data: `bt:${conv.peerChatId}`,
+      },
+    ]);
+  }
+  keyboard.push([
+    { text: "✖️ Закрыть", style: "danger" as const, callback_data: cb("x") },
+  ]);
+  return { text: lines.join("\n"), keyboard };
+}
+
+async function handleDmSettingsCommand(
+  ctx: { runMutation: any; runQuery: any },
+  message: TgMessage,
+): Promise<void> {
+  const userId = message.from?.id;
+  if (!userId) return;
+  const panel = await renderDmSettingsPanel(ctx, userId, message.chat.id);
+  await sendMessage(message.chat.id, panel.text, {
+    parseMode: "HTML",
+    inlineKeyboard: panel.keyboard,
+  });
+}
+
+// bt:<peerChatId> — toggles autoSendTranscript for one business
+// conversation and re-renders the DM panel in place.
+async function handleBusinessToggleCallback(
+  ctx: { runMutation: any; runQuery: any },
+  cb: TgCallbackQuery,
+  parts: string[],
+): Promise<void> {
+  const peerChatId = Number(parts[1]);
+  if (!Number.isFinite(peerChatId)) {
+    await answerCallbackQuery(cb.id);
+    return;
+  }
+  const connection = await ctx.runQuery(
+    internal.businessConnections.findEnabledByUser,
+    { userId: cb.from.id },
+  );
+  if (!connection) {
+    await answerCallbackQuery(cb.id, "Бот не подключён к аккаунту", true);
+    return;
+  }
+  const enabled: boolean = await ctx.runMutation(
+    internal.businessChatSettings.toggleAutoSend,
+    { connectionId: connection.connectionId, peerChatId },
+  );
+  await answerCallbackQuery(
+    cb.id,
+    enabled
+      ? "📤 Расшифровки ваших войсов будут отправляться собеседнику"
+      : "💤 Авто-отправка выключена",
+  );
+  if (cb.message) {
+    const panel = await renderDmSettingsPanel(
+      ctx,
+      cb.from.id,
+      cb.message.chat.id,
+    );
+    await editMessageText(cb.message.chat.id, cb.message.message_id, panel.text, {
+      parseMode: "HTML",
+      inlineKeyboard: panel.keyboard,
+    });
+  }
+}
+
+// ---- «Отправить собеседнику»: business summary delivery -------------------
+
+// bx:<shortId> — one tap on the owner's DM message delivers the summary
+// of their outgoing voice into the managed conversation (from the owner's
+// account, as a reply to the voice). Pressable from the very first
+// "Обрабатываю…" placeholder: if the summary isn't ready yet the press is
+// QUEUED and the pipeline delivers it the moment generation finishes.
+// bxc:<shortId> — tap on the queued button, cancels that pending send.
+async function handleBusinessSendCallback(
+  ctx: { runMutation: any; runQuery: any },
+  cb: TgCallbackQuery,
+  shortId: string,
+  cancel = false,
+): Promise<void> {
+  const voice = (await ctx.runQuery(internal.voiceMessages.getByShortId, {
+    shortId,
+  })) as Doc<"voiceMessages"> | null;
+  if (!voice || !voice.businessConnectionId) {
+    await answerCallbackQuery(cb.id, "Сообщение не найдено");
+    return;
+  }
+  if (cb.from.id !== voice.businessUserChatId) {
+    await answerCallbackQuery(
+      cb.id,
+      "Кнопка только для владельца аккаунта",
+      true,
+    );
+    return;
+  }
+  if (voice.businessSentAt !== undefined) {
+    await answerCallbackQuery(cb.id, "Уже отправлено собеседнику");
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "sent");
+    return;
+  }
+
+  if (cancel) {
+    await ctx.runMutation(internal.voiceMessages.setBusinessSendQueued, {
+      id: voice._id,
+      queued: false,
+    });
+    await answerCallbackQuery(cb.id, "Отправка отменена");
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "idle");
+    return;
+  }
+
+  // Summary not ready yet (still transcribing/summarizing) → queue it.
+  const ready = voice.status === "done" && voice.transcript;
+  if (!ready) {
+    await ctx.runMutation(internal.voiceMessages.setBusinessSendQueued, {
+      id: voice._id,
+      queued: true,
+    });
+    await answerCallbackQuery(
+      cb.id,
+      "⏳ Отправлю собеседнику, как только summary будет готов",
+    );
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "queued");
+    return;
+  }
+
+  // Ready → claim and send right now.
+  const claimed: boolean = await ctx.runMutation(
+    internal.voiceMessages.claimBusinessSend,
+    { id: voice._id, onlyIfQueued: false },
+  );
+  if (!claimed) {
+    await answerCallbackQuery(cb.id, "Уже отправлено собеседнику");
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "sent");
+    return;
+  }
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId: voice.businessUserChatId ?? voice.chatId,
+  })) as ResolvedChatSettings;
+  const session = {
+    mode: (voice.displayedMode ?? "auto") as ModeKey,
+    context: (voice.displayedContext ?? "auto") as ContextKey,
+    detail: (voice.displayedDetail ?? settings.detail) as Detail,
+  };
+  try {
+    const summary = await loadOrGenerateForSession(ctx, voice, session);
+    await sendBusinessSummary(ctx, voice, summary, voice.transcript!);
+  } catch (err) {
+    console.warn(
+      "manual business summary send failed",
+      err instanceof Error ? err.message : String(err),
+    );
+    await ctx.runMutation(internal.voiceMessages.releaseBusinessSend, {
+      id: voice._id,
+    });
+    await answerCallbackQuery(
+      cb.id,
+      "Не удалось отправить — проверьте, что бот всё ещё подключён к аккаунту",
+      true,
+    );
+    await refreshBusinessSendKeyboard(ctx, cb, shortId, "idle");
+    return;
+  }
+  await answerCallbackQuery(cb.id, "📤 Отправлено собеседнику");
+  await refreshBusinessSendKeyboard(ctx, cb, shortId, "sent");
+}
+
+// Re-renders just the send button on whichever message carries it (the
+// loading placeholder or the finished summary — both use the same
+// keyboard shape).
+async function refreshBusinessSendKeyboard(
+  ctx: { runQuery: any },
+  cb: TgCallbackQuery,
+  shortId: string,
+  state: "idle" | "queued" | "sent",
+): Promise<void> {
+  if (!cb.message) return;
+  const hasCancelRow = (cb.message.reply_markup?.inline_keyboard ?? []).some(
+    (row) => row.some((b) => b.callback_data === `dv:${shortId}`),
+  );
+  const isPlaceholder =
+    hasCancelRow &&
+    !(cb.message.reply_markup?.inline_keyboard ?? []).some((row) =>
+      row.some((b) => b.callback_data === `gs:${shortId}`),
+    );
+  const keyboard: InlineKeyboard = isPlaceholder
+    ? [
+        [businessSendButton(shortId, state)],
+        [{ text: "❌ Отмена", callback_data: `dv:${shortId}` }],
+      ]
+    : (buildOpenInBotKeyboard(
+        await ctx.runQuery(internal.botConfig.getBotUsername, {}),
+        shortId,
+        { businessSend: true, businessState: state },
+      ) ?? []);
+  await editMessageReplyMarkup(
+    cb.message.chat.id,
+    cb.message.message_id,
+    keyboard,
+  ).catch(() => {});
+}
+
+// ---- /reaction: change the on-demand trigger reaction ---------------------
+
+async function handleReactionCommand(
+  ctx: { runMutation: any; runQuery: any },
+  message: TgMessage,
+  commandText: string,
+): Promise<void> {
+  const chatId = message.chat.id;
+  const userId = message.from?.id;
+  if (!userId) return;
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  })) as ResolvedChatSettings;
+
+  const respond = async (text: string) => {
+    const eph = await sendEphemeralMessage(chatId, userId, text, {
+      parseMode: "HTML",
+      replyToEphemeralMessageId: message.ephemeral_message_id,
+    });
+    if (!eph) {
+      await sendMessage(chatId, text, {
+        parseMode: "HTML",
+        replyToMessageId: message.message_id || undefined,
+      });
+    }
+  };
+
+  const arg = commandText.replace(/^\/reaction(@[\w_]+)?\s*/i, "").trim();
+
+  // Premium (custom emoji) reaction: the emoji arrives as a custom_emoji
+  // entity on the command message.
+  const customEntity = message.entities?.find(
+    (e) => e.type === "custom_emoji" && e.custom_emoji_id,
+  );
+  if (customEntity && message.text) {
+    const display = message.text.slice(
+      customEntity.offset,
+      customEntity.offset + customEntity.length,
+    );
+    await ctx.runMutation(internal.chatSettings.update, {
+      chatId,
+      reactionType: "custom_emoji",
+      reactionValue: customEntity.custom_emoji_id!,
+      reactionDisplay: display,
+    });
+    await respond(
+      `Реакция-триггер: ${escapeHtml(display)} (премиум-эмодзи). Бот сможет ставить её, только если она разрешена админами чата или уже стоит на сообщении.`,
+    );
+    return;
+  }
+
+  if (!arg) {
+    await respond(
+      `Реакция-триггер сейчас: ${escapeHtml(settings.reaction.display)}\n\n` +
+        `Сменить: <code>/reaction &lt;эмодзи&gt;</code> — любая обычная или премиум-реакция.\n` +
+        `Сбросить: <code>/reaction reset</code> (вернёт 👀).`,
+    );
+    return;
+  }
+
+  if (/^reset$/i.test(arg)) {
+    await ctx.runMutation(internal.chatSettings.update, {
+      chatId,
+      reactionType: "emoji",
+      reactionValue: "👀",
+      reactionDisplay: "👀",
+    });
+    await respond("Реакция-триггер сброшена на 👀.");
+    return;
+  }
+
+  // Plain emoji: Telegram only allows reactions from its fixed set. Try
+  // the raw arg and the variation-selector-stripped form.
+  const stripped = arg.replace(/️/g, "");
+  const emoji = ALLOWED_REACTION_EMOJI.has(arg)
+    ? arg
+    : ALLOWED_REACTION_EMOJI.has(stripped)
+      ? stripped
+      : null;
+  if (!emoji) {
+    await respond(
+      `«${escapeHtml(arg)}» нельзя использовать как обычную реакцию — Telegram разрешает только фиксированный набор эмодзи-реакций. ` +
+        `Отправьте <code>/reaction</code> с премиум-эмодзи, либо выберите из типовых: ${REACTION_PRESETS.join(" ")}`,
+    );
+    return;
+  }
+  await ctx.runMutation(internal.chatSettings.update, {
+    chatId,
+    reactionType: "emoji",
+    reactionValue: emoji,
+    reactionDisplay: emoji,
+  });
+  await respond(`Реакция-триггер: ${emoji}`);
+}
+
+// ---- Bot-mention summon: reply to a voice with @bot → public summary ------
+
+// Returns true when the message was a bot mention replying to a voice and
+// was handled. Works in every delivery mode; in on-demand mode the summon
+// message itself is deleted (needs the delete-messages admin right —
+// failure is tolerated).
+async function maybeHandleVoiceMentionSummon(
+  ctx: { runMutation: any; runQuery: any; scheduler: any },
+  message: TgMessage,
+  commandText: string,
+): Promise<boolean> {
+  const target = message.reply_to_message;
+  if (!target) return false;
+  const media = extractMedia(target);
+  if (!media) return false;
+
+  const botUsername = (await ctx.runQuery(
+    internal.botConfig.getBotUsername,
+    {},
+  )) as string | null;
+  if (!botUsername) return false;
+  const mentionRe = new RegExp(
+    `@${botUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
+    "i",
+  );
+  if (!mentionRe.test(commandText)) return false;
+
+  const allowed = getAllowedChatIds();
+  if (allowed && !allowed.has(message.chat.id)) return true;
+
+  const chatId = message.chat.id;
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+    chatId,
+  })) as ResolvedChatSettings;
+  if (settings.deliveryMode === "onDemand") {
+    // Keep the chat clean: the tag did its job, the transcription follows.
+    await deleteMessage(chatId, message.message_id);
+  }
+
+  await summonVoiceSummary(ctx, chatId, target, media);
+  return true;
+}
+
+// Shared by the bot-mention summon and the /s-as-reply command: makes sure
+// the target voice ends up with a PUBLIC summary reply, whatever state
+// it's in and whatever the chat's delivery mode is.
+async function summonVoiceSummary(
+  ctx: { runMutation: any; runQuery: any; scheduler: any },
+  chatId: number,
+  target: TgMessage,
+  media: MediaInfo,
+): Promise<void> {
+  const voice = (await ctx.runQuery(internal.voiceMessages.findByMessage, {
+    chatId,
+    messageId: target.message_id,
+  })) as Doc<"voiceMessages"> | null;
+
+  if (!voice) {
+    await handleVoice(ctx, target, media, { forceInstant: true });
+    return;
+  }
+
+  if (
+    voice.transcript &&
+    (voice.status === "done" || voice.status === "ignored")
+  ) {
+    const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
+      chatId,
+    })) as ResolvedChatSettings;
+    await postPublicVoiceSummary(ctx, voice, settings);
+    return;
+  }
+
+  if (voice.status === "error") {
+    await sendMessage(
+      chatId,
+      `Не удалось обработать это голосовое: ${escapeHtml(voice.error ?? "неизвестная ошибка")}`,
+      { replyToMessageId: target.message_id },
+    );
+    return;
+  }
+
+  // Still processing — upgrade the delivery plan so the pipeline commits
+  // the summary publicly when it finishes.
+  await ctx.runMutation(internal.voiceMessages.setDelivery, {
+    id: voice._id,
+    delivery: "instant",
+  });
+}
+
+// Renders the voice's current (or default) summary and posts it as a NEW
+// public reply to the voice — used by the mention summon, so the answer is
+// always visible even if a summary message already exists elsewhere.
+async function postPublicVoiceSummary(
+  ctx: { runMutation: any; runQuery: any },
+  voice: Doc<"voiceMessages">,
+  settings: ResolvedChatSettings,
+): Promise<void> {
+  if (!voice.transcript) return;
+  const session = {
+    mode: (voice.displayedMode ?? "auto") as ModeKey,
+    context: (voice.displayedContext ?? "auto") as ContextKey,
+    detail: (voice.displayedDetail ?? settings.detail) as Detail,
+  };
+  const summary = await loadOrGenerateForSession(ctx, voice, session);
+  const concrete = resolveAutoForSession(voice, session) ?? {
+    mode: "brief" as const,
+    context: "thinkingOutLoud" as const,
+    detail: session.detail,
+  };
+  const debugMode = await ctx.runQuery(internal.botConfig.getDebugMode, {});
+  const botUsername = await ctx.runQuery(internal.botConfig.getBotUsername, {});
+  const rendered = renderFinal({
+    summary,
+    transcript: voice.transcript,
+    segments: voice.transcriptSegments ?? null,
+    mode: concrete.mode,
+    context: concrete.context,
+    detail: concrete.detail,
+    wasAutoMode: session.mode === "auto",
+    wasAutoContext: session.context === "auto",
+    timings: {},
+    debug: debugMode,
+  });
+  const keyboard = buildOpenInBotKeyboard(botUsername, voice.shortId);
+  await commitFinal({
+    chatId: voice.chatId,
+    ackId: undefined,
+    replyTo: voice.messageId,
+    ...rendered,
+    keyboard,
+  });
+  await ctx.runMutation(internal.voiceMessages.setDisplayed, {
+    id: voice._id,
+    mode: concrete.mode,
+    context: concrete.context,
+    detail: concrete.detail,
+  });
+}
+
+// ---- Reactions → ephemeral summary (on-demand mode) -----------------------
+
+function reactionMatches(
+  r: TgReactionType,
+  trigger: { type: string; value: string },
+): boolean {
+  if (trigger.type === "emoji") {
+    return (
+      r.type === "emoji" &&
+      (r.emoji === trigger.value ||
+        r.emoji?.replace(/️/g, "") === trigger.value.replace(/️/g, ""))
+    );
+  }
+  return r.type === "custom_emoji" && r.custom_emoji_id === trigger.value;
+}
 
 async function handleMessageReaction(
   ctx: { runMutation: any; runQuery: any },
@@ -1218,37 +2412,58 @@ async function handleMessageReaction(
     messageId: mr.message_id,
   })) as Doc<"voiceMessages"> | null;
   if (!voice) return;
-  const settings = await ctx.runQuery(internal.chatSettings.getResolved, {
+  const settings = (await ctx.runQuery(internal.chatSettings.getResolved, {
     chatId,
-  });
-  if (!settings.quietMode) return;
+  })) as ResolvedChatSettings;
+  if (settings.deliveryMode !== "onDemand") return;
+  // Only the trigger reaction summons the transcript — ordinary reactions
+  // (❤️ on a funny voice) shouldn't spam their author with ephemerals.
+  const triggered = (mr.new_reaction ?? []).some((r) =>
+    reactionMatches(r, settings.reaction),
+  );
+  if (!triggered) return;
 
-  if (voice.status !== "done" || !voice.transcript) {
+  if (!voice.transcript) {
     await sendEphemeralMessage(
       chatId,
       user.id,
-      `${loadingEmoji()} <i>Ещё обрабатываю это голосовое — поставьте реакцию чуть позже.</i>`,
+      voice.status === "error"
+        ? `Не удалось расшифровать это голосовое: ${escapeHtml((voice.error ?? "неизвестная ошибка").slice(0, 300))}`
+        : `${loadingEmoji()} <i>Ещё обрабатываю это голосовое — поставьте реакцию чуть позже.</i>`,
       { parseMode: "HTML" },
     );
     return;
   }
 
-  const session = {
-    mode: (voice.displayedMode ?? "auto") as ModeKey,
-    context: (voice.displayedContext ?? "auto") as ContextKey,
-    detail: (voice.displayedDetail ?? settings.detail) as Detail,
-  };
-  const summary = await loadOrGenerateForSession(ctx, voice, session);
-  const summaryHtml = markdownToTelegramHtml(summary);
-  let body = `${summaryHtml}\n\n<blockquote expandable>${escapeHtml(voice.transcript)}</blockquote>`;
+  // Rows without a finished summary ("ignored" from the nonsense filter,
+  // an error after transcription, or a summary still generating) get the
+  // transcript alone — it's ready and that's what the reactor wants.
+  let body: string;
+  if (voice.status !== "done") {
+    body = `<blockquote expandable>${escapeHtml(voice.transcript)}</blockquote>`;
+  } else {
+    const session = {
+      mode: (voice.displayedMode ?? "auto") as ModeKey,
+      context: (voice.displayedContext ?? "auto") as ContextKey,
+      detail: (voice.displayedDetail ?? settings.detail) as Detail,
+    };
+    const summary = await loadOrGenerateForSession(ctx, voice, session);
+    const summaryHtml = markdownToTelegramHtml(summary);
+    body = `${summaryHtml}\n\n<blockquote expandable>${escapeHtml(voice.transcript)}</blockquote>`;
+    if (body.length > TG_TEXT_LIMIT) {
+      // Drop the transcript quote first; truncate the summary as a last
+      // resort (tag-safe).
+      body =
+        summaryHtml.length <= TG_TEXT_LIMIT
+          ? summaryHtml
+          : splitHtmlSafely(summaryHtml, TG_TEXT_LIMIT - 60)[0] +
+            "\n\n<i>(обрезано — полная версия в боте)</i>";
+    }
+  }
   if (body.length > TG_TEXT_LIMIT) {
-    // Drop the transcript quote first; truncate the summary as a last
-    // resort (tag-safe).
     body =
-      summaryHtml.length <= TG_TEXT_LIMIT
-        ? summaryHtml
-        : splitHtmlSafely(summaryHtml, TG_TEXT_LIMIT - 60)[0] +
-          "\n\n<i>(обрезано — полная версия в боте)</i>";
+      splitHtmlSafely(body, TG_TEXT_LIMIT - 60)[0] +
+      "\n\n<i>(обрезано — полная версия в боте)</i>";
   }
   const botUsername = await ctx.runQuery(internal.botConfig.getBotUsername, {});
   const keyboard: InlineKeyboard | undefined =
@@ -1340,8 +2555,23 @@ const GROUP_STYLE_MODE_KEYS: Exclude<ModeKey, "auto">[] = [
   "keyPoints",
 ];
 
-// gs:<shortId> — opens an ephemeral mode picker for the voice author.
-// Uses the callback's 15-second window, so it works without admin rights.
+// True when this user may restyle the voice's chat message: its author,
+// or — for business voices — the account owner (the summary lives in the
+// owner's DM, and incoming voices are authored by the peer).
+function canRestyleVoice(userId: number, voice: Doc<"voiceMessages">): boolean {
+  if (userId === voice.fromId) return true;
+  return (
+    voice.businessUserChatId !== undefined &&
+    userId === voice.businessUserChatId
+  );
+}
+
+// gs:<shortId> — opens a style picker for the voice author. In groups it's
+// an ephemeral message (uses the callback's 15-second window, so it works
+// without admin rights); in private chats (bot DM, business results)
+// ephemeral sends aren't available — Telegram only supports them in
+// groups — so the picker is a regular message, which is fine there since
+// the whole chat is private anyway.
 async function openGroupStylePicker(
   ctx: { runQuery: any },
   cb: TgCallbackQuery,
@@ -1354,7 +2584,7 @@ async function openGroupStylePicker(
     await answerCallbackQuery(cb.id, "Сообщение не найдено");
     return;
   }
-  if (cb.from.id !== voice.fromId) {
+  if (!canRestyleVoice(cb.from.id, voice)) {
     await answerCallbackQuery(
       cb.id,
       "Только автор голосового может менять стиль в чате",
@@ -1372,6 +2602,20 @@ async function openGroupStylePicker(
       })),
     );
   }
+
+  if (cb.message?.chat.type === "private") {
+    await answerCallbackQuery(cb.id);
+    await sendMessage(
+      cb.message.chat.id,
+      "Стиль summary для этого голосового:",
+      {
+        inlineKeyboard: rows,
+        replyToMessageId: cb.message.message_id,
+      },
+    );
+    return;
+  }
+
   const eph = await sendEphemeralMessage(
     voice.chatId,
     cb.from.id,
@@ -1403,7 +2647,7 @@ async function applyGroupStyle(
     await answerCallbackQuery(cb.id, "Сообщение не найдено");
     return;
   }
-  if (cb.from.id !== voice.fromId) {
+  if (!canRestyleVoice(cb.from.id, voice)) {
     await answerCallbackQuery(cb.id, "Только автор голосового", true);
     return;
   }
@@ -1465,13 +2709,14 @@ async function handleSummaryCommand(
   message: TgMessage,
 ): Promise<void> {
   // If the user sent /s, /sum or /summary as a reply to a voice/audio/
-  // video_note, treat it as a "resummarize this voice" request — same
-  // behavior as the old /summarize command. The chat-summary path is for
-  // when the command is used standalone.
+  // video_note, treat it as a "summarize this voice" request — same
+  // behavior as the bot-mention summon: always answers publicly, in any
+  // delivery mode. The chat-summary path is for when the command is used
+  // standalone.
   const replyTarget = message.reply_to_message;
   const replyMedia = replyTarget ? extractMedia(replyTarget) : null;
   if (replyTarget && replyMedia) {
-    await handleVoice(ctx, replyTarget, replyMedia);
+    await summonVoiceSummary(ctx, message.chat.id, replyTarget, replyMedia);
     return;
   }
 
@@ -2028,8 +3273,9 @@ async function loadOrGenerateForSession(
     loreRows && loreRows.length > 0
       ? loreRows.map((r: any) => `- ${r.text}`).join("\n")
       : null;
+  // Business voices: the model pick lives in the owner's DM settings.
   const chatSettings = await ctx.runQuery(internal.chatSettings.getResolved, {
-    chatId: voice.chatId,
+    chatId: voice.businessUserChatId ?? voice.chatId,
   });
   const { text } = await getOrGenerateSummary(ctx, voice._id, {
     transcript: voice.transcript,
@@ -2058,6 +3304,22 @@ async function handleCallback(
   // callback_data because ephemeral-origin callbacks may arrive without a
   // usable cb.message (ephemeral messages have message_id 0).
   try {
+    if (parts[0] === "st") {
+      await handleSettingsCallback(ctx, cb, parts);
+      return;
+    }
+    if (parts[0] === "bt" && parts.length === 2) {
+      await handleBusinessToggleCallback(ctx, cb, parts);
+      return;
+    }
+    if (parts[0] === "bx" && parts.length === 2) {
+      await handleBusinessSendCallback(ctx, cb, parts[1]);
+      return;
+    }
+    if (parts[0] === "bxc" && parts.length === 2) {
+      await handleBusinessSendCallback(ctx, cb, parts[1], true);
+      return;
+    }
     if (parts[0] === "mm") {
       await handleModalCallback(ctx, cb, parts);
       return;
@@ -2409,7 +3671,7 @@ async function applyToChat(
     await answerCallbackQuery(cb.id, "Сообщение не найдено");
     return;
   }
-  if (cb.from.id !== voice.fromId) {
+  if (!canRestyleVoice(cb.from.id, voice)) {
     await answerCallbackQuery(
       cb.id,
       "Только автор сообщения может менять отображение в чате",
@@ -2468,7 +3730,7 @@ async function regenerateVoiceInChat(
   if (!voice.transcript) return;
   const debugMode = await ctx.runQuery(internal.botConfig.getDebugMode, {});
   const chatSettings = await ctx.runQuery(internal.chatSettings.getResolved, {
-    chatId: voice.chatId,
+    chatId: voice.businessUserChatId ?? voice.chatId,
   });
   const memory = await ctx.runQuery(internal.chatMemory.get, {
     chatId: voice.chatId,
@@ -2513,11 +3775,24 @@ async function regenerateVoiceInChat(
     timings: {},
     debug: debugMode,
   });
-  const keyboard = buildOpenInBotKeyboard(botUsername, voice.shortId);
+  const keyboard = buildOpenInBotKeyboard(botUsername, voice.shortId, {
+    businessSend:
+      voice.businessConnectionId !== undefined &&
+      voice.businessOutgoing === true,
+    businessState:
+      voice.businessSentAt !== undefined
+        ? "sent"
+        : voice.businessSendQueued === true
+          ? "queued"
+          : "idle",
+  });
+  // Business voices live in a managed conversation, but the bot's summary
+  // message for them is in the OWNER's DM — restyle edits go there.
+  const isBusinessResult = voice.businessUserChatId !== undefined;
   await commitFinal({
-    chatId: voice.chatId,
+    chatId: voice.businessUserChatId ?? voice.chatId,
     ackId: voice.ackMessageId,
-    replyTo: voice.messageId,
+    replyTo: isBusinessResult ? undefined : voice.messageId,
     ...rendered,
     keyboard,
   });
@@ -2566,7 +3841,7 @@ async function handleAdminText(
         );
         return;
       }
-      await handleVoice(ctx, target, media);
+      await summonVoiceSummary(ctx, chatId, target, media);
       return;
     }
 

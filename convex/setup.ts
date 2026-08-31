@@ -38,7 +38,7 @@ export const registerWebhook = internalAction({
       webhookSecret: secret,
     });
 
-    // Command list. /modal and /quiet are ephemeral (Bot API 10.2): the
+    // Command list. Settings commands are ephemeral (Bot API 10.2): the
     // command message itself is invisible in the chat and the bot can
     // answer ephemerally without admin rights.
     try {
@@ -46,13 +46,23 @@ export const registerWebhook = internalAction({
         { command: "summary", description: "Summary переписки за период" },
         { command: "search", description: "Поиск по истории чата" },
         {
+          command: "settings",
+          description: "Настройки бота в этом чате",
+          is_ephemeral: true,
+        },
+        {
+          command: "reaction",
+          description: "Сменить реакцию-триггер",
+          is_ephemeral: true,
+        },
+        {
           command: "modal",
           description: "Выбрать модель суммаризации",
           is_ephemeral: true,
         },
         {
           command: "quiet",
-          description: "Тихий режим вкл/выкл",
+          description: "Режим «по требованию» вкл/выкл",
           is_ephemeral: true,
         },
       ]);
