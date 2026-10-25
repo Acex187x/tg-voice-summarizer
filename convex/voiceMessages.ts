@@ -81,6 +81,8 @@ export const create = internalMutation({
     businessConnectionId: v.optional(v.string()),
     businessUserChatId: v.optional(v.number()),
     businessOutgoing: v.optional(v.boolean()),
+    replyContext: v.optional(v.string()),
+    forwardedFromName: v.optional(v.string()),
     delivery: v.optional(
       v.union(
         v.literal("instant"),
@@ -168,9 +170,14 @@ export const setAutoResolution = internalMutation({
     id: v.id("voiceMessages"),
     autoMode: v.string(),
     autoContext: v.string(),
+    autoSpeechAct: v.optional(v.string()),
   },
-  handler: async (ctx, { id, autoMode, autoContext }) => {
-    await ctx.db.patch(id, { autoMode, autoContext });
+  handler: async (ctx, { id, autoMode, autoContext, autoSpeechAct }) => {
+    await ctx.db.patch(id, {
+      autoMode,
+      autoContext,
+      ...(autoSpeechAct ? { autoSpeechAct } : {}),
+    });
   },
 });
 
@@ -266,5 +273,20 @@ export const setTimings = internalMutation({
   },
   handler: async (ctx, { id, timings }) => {
     await ctx.db.patch(id, { timings });
+  },
+});
+
+// Voices this sender pushed through the bot since `sinceMs` — the public
+// DM quota counter.
+export const countRecentByFrom = internalQuery({
+  args: { fromId: v.number(), sinceMs: v.number() },
+  handler: async (ctx, { fromId, sinceMs }) => {
+    const rows = await ctx.db
+      .query("voiceMessages")
+      .withIndex("by_from", (q) =>
+        q.eq("fromId", fromId).gt("_creationTime", sinceMs),
+      )
+      .take(500);
+    return rows.length;
   },
 });

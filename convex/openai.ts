@@ -3,6 +3,13 @@
 // transcription always goes to OpenAI because OpenRouter does not expose a
 // compatible audio endpoint.
 
+import {
+  TRANSCRIBE_MODEL,
+  TRANSCRIBE_PROMPT,
+  TRANSCRIBE_TIMESTAMPS_MODEL,
+} from "./models";
+import { LONG_VOICE_SECTIONS_MIN_SEC } from "./prompts";
+
 const OPENAI_BASE = "https://api.openai.com/v1";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
@@ -67,6 +74,7 @@ export async function transcribeAudioWithTimestamps(
   audio: Blob,
   model: string,
   filename = "voice.ogg",
+  opts: { prompt?: string } = {},
 ): Promise<TranscriptionResult> {
   const key = getOpenAIKey();
   const wantTimestamps = model.startsWith("whisper");
@@ -76,8 +84,8 @@ export async function transcribeAudioWithTimestamps(
   if (wantTimestamps) {
     form.append("response_format", "verbose_json");
     form.append("timestamp_granularities[]", "segment");
-  } else {
-    form.append("response_format", "text");
+  } else if (opts.prompt) {
+    form.append("prompt", opts.prompt);
   }
 
   const res = await fetch(`${OPENAI_BASE}/audio/transcriptions`, {
@@ -92,7 +100,15 @@ export async function transcribeAudioWithTimestamps(
     );
   }
   if (!wantTimestamps) {
-    return { text: (await res.text()).trim(), segments: [] };
+    // gpt-transcribe & co. answer {text, languages}; older callers asked
+    // for plain text, so accept both.
+    const raw = await res.text();
+    try {
+      const parsed = JSON.parse(raw) as { text?: string };
+      return { text: (parsed.text ?? "").trim(), segments: [] };
+    } catch {
+      return { text: raw.trim(), segments: [] };
+    }
   }
   const json = (await res.json()) as {
     text?: string;
@@ -117,6 +133,57 @@ export async function transcribeAudioWithTimestamps(
       };
     });
   return { text: (json.text ?? "").trim(), segments };
+}
+
+// Telegram file paths look like "voice/file_12.oga" or
+// "video_notes/file_3.mp4" (sometimes without an extension). The audio
+// endpoint picks the decoder from the filename, and gpt-transcribe accepts
+// ".ogg" but not ".oga".
+export function audioFilename(filePath: string, mediaKind?: string): string {
+  const ext = filePath.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
+  if (ext === "oga" || ext === "opus") return "voice.ogg";
+  if (ext && ["ogg", "mp3", "mp4", "m4a", "wav", "webm", "mpeg", "mpga", "flac"].includes(ext)) {
+    return `voice.${ext}`;
+  }
+  return mediaKind === "video_note" ? "voice.mp4" : "voice.ogg";
+}
+
+// Transcribes a Telegram voice/video note/audio. Short voices go to
+// gpt-transcribe (better accuracy, empty text on silence); long ones to
+// whisper-1 for the segment timestamps the sections mode needs. Any
+// gpt-transcribe failure falls back to whisper-1.
+export async function transcribeVoice(
+  audio: Blob,
+  filePath: string,
+  mediaKind?: string,
+  durationSec?: number | null,
+): Promise<TranscriptionResult> {
+  const filename = audioFilename(filePath, mediaKind);
+  if ((durationSec ?? 0) >= LONG_VOICE_SECTIONS_MIN_SEC) {
+    return await transcribeAudioWithTimestamps(
+      audio,
+      TRANSCRIBE_TIMESTAMPS_MODEL,
+      filename,
+    );
+  }
+  try {
+    return await transcribeAudioWithTimestamps(
+      audio,
+      TRANSCRIBE_MODEL,
+      filename,
+      { prompt: TRANSCRIBE_PROMPT },
+    );
+  } catch (err) {
+    console.warn(
+      `${TRANSCRIBE_MODEL} failed, falling back to ${TRANSCRIBE_TIMESTAMPS_MODEL}`,
+      err instanceof Error ? err.message : String(err),
+    );
+    return await transcribeAudioWithTimestamps(
+      audio,
+      TRANSCRIBE_TIMESTAMPS_MODEL,
+      filename,
+    );
+  }
 }
 
 // ---- Chat completion (OpenAI or OpenRouter) -------------------------------

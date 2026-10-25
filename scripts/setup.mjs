@@ -28,6 +28,8 @@ const PUSH_KEYS = [
   "OPENAI_API_KEY",
   "OPENROUTER_API_KEY",
   "ALLOWED_CHAT_IDS",
+  "PUBLIC_DAILY_VOICE_LIMIT",
+  "PUBLIC_MAX_DURATION_SEC",
 ];
 
 function parseEnvFile(text) {

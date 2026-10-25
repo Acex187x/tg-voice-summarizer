@@ -9,7 +9,8 @@
     "dev": "convex dev",
     "deploy": "convex deploy",
     "logs": "convex logs",
-    "register-webhook": "convex run setup:registerWebhook"
+    "register-webhook": "convex run setup:registerWebhook",
+    "eval:voice": "esbuild scripts/eval/run-voice-eval.ts --bundle --platform=node --format=esm --outfile=scripts/eval/.build/run.mjs --log-level=warning && node scripts/eval/.build/run.mjs"
   },
   "keywords": [],
   "author": "",

@@ -8,6 +8,15 @@ import { v } from "convex/values";
 export default defineSchema({
   // Every incoming voice / video note goes here so we can look it up by
   // shortId, cache its transcript, and drive the DM picker off the row.
+  // Throttling state for admin error DMs (see failures.ts): one row per
+  // failure signature.
+  adminAlerts: defineTable({
+    key: v.string(),
+    windowStart: v.number(),
+    count: v.number(),
+    lastSentAt: v.optional(v.number()),
+  }).index("by_key", ["key"]),
+
   voiceMessages: defineTable({
     chatId: v.number(),
     chatTitle: v.optional(v.string()),
@@ -43,6 +52,13 @@ export default defineSchema({
     // on every cache-miss for this voice.
     autoMode: v.optional(v.string()),
     autoContext: v.optional(v.string()),
+    // Router's read of what the speaker wants (prompts.SPEECH_ACTS key).
+    autoSpeechAct: v.optional(v.string()),
+    // What the voice replies to (+ a few preceding chat lines), captured
+    // at ingest. Given to the router and summarizer for understanding only.
+    replyContext: v.optional(v.string()),
+    // Voice forwarded into the bot DM: name of the original speaker.
+    forwardedFromName: v.optional(v.string()),
 
     // Currently displayed summary in the chat message (for author-driven
     // "apply to chat" edits). Resolved, not "auto".
@@ -126,7 +142,9 @@ export default defineSchema({
     .index("by_short_id", ["shortId"])
     // Lookup by the bot's summary message in the source chat — used by
     // the reply-to-summary Q&A flow.
-    .index("by_chat_ack", ["chatId", "ackMessageId"]),
+    .index("by_chat_ack", ["chatId", "ackMessageId"])
+    // Per-sender quota for public (non-admin) DM usage.
+    .index("by_from", ["fromId"]),
 
   businessConnections: defineTable({
     connectionId: v.string(),
@@ -181,7 +199,7 @@ export default defineSchema({
     defaultMode: v.string(),
     defaultContext: v.string(),
     defaultDetail: v.number(),
-    // Summarizer model KEY from models.SUMMARIZE_MODEL_OPTIONS ("gemini" /
+    // Summarizer model KEY from models.SUMMARIZE_MODEL_OPTIONS ("luna" / "gemini" /
     // "grok"), toggled via /modal. Absent → default key.
     summarizeModel: v.optional(v.string()),
     // How the bot answers voices from regular members (/settings):

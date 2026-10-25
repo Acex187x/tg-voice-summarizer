@@ -2,14 +2,15 @@ import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { internalAction } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
+import { userFacingFailureText } from "./failures";
 import {
   isSummarizeModelKey,
   SUMMARIZE_MODEL_OPTIONS,
   summarizeModelId,
-  TRANSCRIBE_MODEL,
   type SummarizeModelKey,
 } from "./models";
-import { transcribeAudioWithTimestamps } from "./openai";
+import { transcribeVoice } from "./openai";
+import { detectAsrNoise, stripAsrTail } from "./voicePolicy";
 import {
   answerSummaryQuestion,
   buildChatLogFor,
@@ -21,6 +22,7 @@ import {
   getOrGenerateSummaryStreaming,
   renderChatSummaryFinal,
   renderFinal,
+  reportVoiceFailure,
   resolveVoiceSettings,
   businessSendButton,
   sendBusinessSummary,
@@ -139,6 +141,14 @@ type TgMessage = {
   document?: TgDocument;
   sticker?: TgSticker;
   reply_to_message?: TgMessage;
+  // Forwarded messages: who originally sent it (Bot API 7.0+).
+  forward_origin?: {
+    type: string; // "user" | "hidden_user" | "chat" | "channel"
+    sender_user?: TgUser;
+    sender_user_name?: string;
+    sender_chat?: TgChat;
+    chat?: TgChat;
+  };
   reply_markup?: {
     inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>>;
   };
@@ -193,7 +203,26 @@ function getAllowedChatIds(): Set<number> | null {
   return ids.length > 0 ? new Set(ids) : null;
 }
 
+// Public (non-admin) DM usage limits. Anyone can forward voices to the bot;
+// these keep a single user from burning the API budget.
+function envNumber(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const PUBLIC_DAILY_VOICE_LIMIT = () => envNumber("PUBLIC_DAILY_VOICE_LIMIT", 40);
+const PUBLIC_MAX_DURATION_SEC = () => envNumber("PUBLIC_MAX_DURATION_SEC", 30 * 60);
+
 // ---- Help text -----------------------------------------------------------
+
+function publicHelpText(botUsername: string | null): string {
+  const mention = botUsername ? `@${botUsername}` : "меня";
+  return `Привет! Я делаю короткие summary голосовых и видеокружков.
+
+• Перешли мне войс или кружок — пришлю суть и расшифровку.
+• Добавь меня в группу — буду отвечать на войсы там. Выдай админку, чтобы работали реакции и режим «по требованию».
+• В чате, где меня нет (даже в личке с кем-то), ответь на войс упоминанием ${mention} — сделаю summary прямо там.
+• С Telegram Premium подключи меня в «Настройки → Telegram для бизнеса → Чат-боты» — буду присылать сюда summary войсов из твоих личных переписок. Настройки — /settings.`;
+}
 
 const HELP_TEXT = `Команды админа:
 
@@ -285,16 +314,16 @@ export const handleUpdate = internalAction({
     const media = extractMedia(message);
     if (media) {
       if (isPrivateChat) {
-        // In the private chat with the bot, only the admin gets new
-        // voices processed. (Non-admins arrive here via /start deep links
-        // and interact with the picker, not by sending their own voices.)
-        if (!isAdmin) {
-          await sendMessage(
-            message.chat.id,
-            "Этот бот работает только для администратора.",
-            {},
-          );
-          return;
+        // Anyone can send or forward voices to the bot's DM; non-admins
+        // are rate-limited per day and capped on duration.
+        if (!isAdmin && fromId !== undefined) {
+          const limited = await publicDmLimitMessage(ctx, fromId, media);
+          if (limited) {
+            await sendMessage(message.chat.id, limited, {
+              replyToMessageId: message.message_id,
+            });
+            return;
+          }
         }
         await handleVoice(ctx, message, media);
         return;
@@ -313,6 +342,15 @@ export const handleUpdate = internalAction({
     //    Format: `/start v<shortId>` for a voice, `/start c<shortId>` for
     //    a chat summary.
     const startPayload = parseStartPayload(commandText);
+    if (
+      isPrivateChat &&
+      !isAdmin &&
+      (startPayload === "" || /^\/help(?:@[\w_]+)?$/i.test(commandText.trim()))
+    ) {
+      const botUsername = await ctx.runQuery(internal.botConfig.getBotUsername, {});
+      await sendMessage(message.chat.id, publicHelpText(botUsername), {});
+      return;
+    }
     if (startPayload) {
       if (startPayload.startsWith("v")) {
         await handleVoiceDeepLink(ctx, message, startPayload.slice(1));
@@ -375,7 +413,7 @@ export const handleUpdate = internalAction({
         if (isPrivateChat) {
           await sendMessage(
             message.chat.id,
-            "Этот бот предназначен только для администратора.",
+            "Импорт истории доступен только владельцу бота.",
             {},
           );
         }
@@ -443,14 +481,15 @@ export const handleUpdate = internalAction({
       if (handled) return;
     }
 
-    // 4. Admin-only commands.
+    // 4. Admin-only commands. Everyone else gets the public help on
+    // commands; plain chatter in the DM stays unanswered.
     if (!isAdmin) {
-      if (isPrivateChat) {
-        await sendMessage(
-          message.chat.id,
-          "Этот бот предназначен только для администратора.",
+      if (isPrivateChat && commandText.startsWith("/")) {
+        const botUsername = await ctx.runQuery(
+          internal.botConfig.getBotUsername,
           {},
         );
+        await sendMessage(message.chat.id, publicHelpText(botUsername), {});
       }
       return;
     }
@@ -597,20 +636,33 @@ async function handleGuestMessage(
     if (!transcript) {
       const filePath = await getFilePath(media.fileId);
       const audio = await downloadFile(filePath);
-      const result = await transcribeAudioWithTimestamps(
+      const result = await transcribeVoice(
         audio,
-        TRANSCRIBE_MODEL,
-        "voice.ogg",
+        filePath,
+        media.kind,
+        media.duration,
       );
-      transcript = result.text;
+      transcript = stripAsrTail(result.text);
       segments = result.segments;
-      if (!transcript) throw new Error("Whisper returned empty transcript");
-      await ctx.runMutation(internal.voiceMessages.setTranscript, {
-        id: voice._id,
-        transcript,
-        segments,
-      });
+      if (transcript) {
+        await ctx.runMutation(internal.voiceMessages.setTranscript, {
+          id: voice._id,
+          transcript,
+          segments,
+        });
+      }
     }
+    // Explicitly summoned, so answer — but don't summarize silence.
+    if (detectAsrNoise(transcript ?? "")) {
+      await finishGuestWithText(
+        guestQueryId,
+        inlineMessageId,
+        "В этом сообщении не слышно речи 🤷",
+        labelForMedia(media.kind),
+      );
+      return;
+    }
+    if (!transcript) return;
 
     await editGuestProgress(inlineMessageId, "Готовлю summary…");
     const settings = await resolveGuestVoiceSettings(ctx, voice, transcript);
@@ -669,13 +721,13 @@ async function handleGuestMessage(
       labelForMedia(media.kind),
     );
   } catch (err) {
-    console.warn("guest summary failed", err);
     const msg = err instanceof Error ? err.message : String(err);
+    const failure = await reportVoiceFailure(ctx, msg, "Гостевой войс");
     await finishGuestWithText(
       guestQueryId,
       inlineMessageId,
-      `Не удалось обработать голосовое: ${msg.slice(0, 500)}`,
-    );
+      userFacingFailureText(failure.kind),
+    ).catch(() => {});
   }
 }
 
@@ -961,6 +1013,120 @@ function isChannelSenderMessage(message: TgMessage): boolean {
   );
 }
 
+// Returns a refusal text when a non-admin is over the public DM limits.
+async function publicDmLimitMessage(
+  ctx: { runQuery: any },
+  fromId: number,
+  media: MediaInfo,
+): Promise<string | null> {
+  const maxDuration = PUBLIC_MAX_DURATION_SEC();
+  if ((media.duration ?? 0) > maxDuration) {
+    return `Это слишком длинное сообщение — я беру до ${Math.round(maxDuration / 60)} минут.`;
+  }
+  const limit = PUBLIC_DAILY_VOICE_LIMIT();
+  const used = await ctx.runQuery(internal.voiceMessages.countRecentByFrom, {
+    fromId,
+    sinceMs: Date.now() - 24 * 60 * 60 * 1000,
+  });
+  if (used >= limit) {
+    return `На сегодня всё: лимит ${limit} сообщений в сутки. Попробуй завтра 🙏`;
+  }
+  return null;
+}
+
+// Original speaker of a voice forwarded into the bot DM.
+function forwardedSenderName(message: TgMessage): string | undefined {
+  const o = message.forward_origin;
+  if (!o) return undefined;
+  if (o.sender_user) {
+    return (
+      [o.sender_user.first_name, o.sender_user.last_name]
+        .filter(Boolean)
+        .join(" ") || undefined
+    );
+  }
+  return o.sender_user_name ?? o.sender_chat?.title ?? o.chat?.title;
+}
+
+function clipText(text: string, max: number): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+function senderLabel(m: TgMessage): string {
+  return (
+    [m.from?.first_name, m.from?.last_name].filter(Boolean).join(" ") ||
+    m.sender_chat?.title ||
+    "кого-то"
+  );
+}
+
+// What the voice is answering: the replied-to message (its transcript if
+// it was a voice) and, in groups, the last few lines before it. A third of
+// voices are replies, and without this the summarizer misreads irony and
+// rebuttals. Stored on the row at ingest; used only for understanding.
+async function buildReplyContext(
+  ctx: { runQuery: any },
+  message: TgMessage,
+): Promise<string | undefined> {
+  const parts: string[] = [];
+  const target = message.reply_to_message;
+  if (target) {
+    let text = target.text ?? target.caption ?? "";
+    if (!text && extractMedia(target)) {
+      const replied = (await ctx.runQuery(internal.voiceMessages.findByMessage, {
+        chatId: message.chat.id,
+        messageId: target.message_id,
+      })) as Doc<"voiceMessages"> | null;
+      text = replied?.transcript ? `[войс] ${replied.transcript}` : "[войс]";
+    }
+    if (!text) {
+      text = target.photo
+        ? "[фото]"
+        : target.video
+          ? "[видео]"
+          : target.sticker
+            ? "[стикер]"
+            : target.document
+              ? "[файл]"
+              : "";
+    }
+    if (text) {
+      parts.push(
+        `Войс — ответ на сообщение от ${senderLabel(target)}: «${clipText(text, 600)}»`,
+      );
+    }
+  }
+  const isGroup =
+    message.chat.type === "group" || message.chat.type === "supergroup";
+  if (isGroup && !message.business_connection_id) {
+    const voiceTs = message.date ?? Math.floor(Date.now() / 1000);
+    const recent = (await ctx.runQuery(internal.chatMessages.latest, {
+      chatId: message.chat.id,
+      limit: 8,
+    })) as Doc<"chatMessages">[];
+    const before = recent
+      .filter(
+        (r) =>
+          r.messageId < message.message_id &&
+          r.messageId !== target?.message_id &&
+          voiceTs - r.ts <= 15 * 60 &&
+          r.text &&
+          r.text.trim().length > 0,
+      )
+      .slice(0, 4)
+      .reverse();
+    if (before.length > 0) {
+      const lines = before.map(
+        (r) =>
+          `${r.fromFirstName ?? r.fromName ?? "кто-то"}: ${clipText(r.text!, 220)}`,
+      );
+      parts.push(`Последние сообщения в чате перед войсом:\n${lines.join("\n")}`);
+    }
+  }
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
 async function handleVoice(
   ctx: { runMutation: any; runQuery: any; scheduler: any },
   message: TgMessage,
@@ -992,6 +1158,11 @@ async function handleVoice(
   const ackChatId = opts.privateResult
     ? opts.businessUserChatId
     : message.chat.id;
+  const replyContext = await buildReplyContext(ctx, message);
+  const forwardedFromName =
+    message.chat.type === "private" && !opts.businessConnectionId
+      ? forwardedSenderName(message)
+      : undefined;
 
   // Resolve the delivery plan for this specific voice.
   const isGroup = !opts.privateResult && message.chat.type !== "private";
@@ -1090,6 +1261,8 @@ async function handleVoice(
     businessConnectionId: opts.businessConnectionId,
     businessUserChatId: opts.businessUserChatId,
     businessOutgoing: opts.businessOutgoing,
+    replyContext,
+    forwardedFromName,
     delivery,
   });
   // Pull the freshly-generated shortId and link it back to the chat-log

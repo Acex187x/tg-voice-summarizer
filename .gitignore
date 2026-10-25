@@ -136,3 +136,6 @@ dist
 .pnp.*
 
 convex/_generated
+
+# Voice eval bundle (npm run eval:voice)
+scripts/eval/.build/

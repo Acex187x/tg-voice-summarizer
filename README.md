@@ -1,8 +1,9 @@
 # tg-voice-summarizer
 
-Telegram bot that listens to voice messages, transcribes them with OpenAI
-Whisper, classifies each one into a user-defined "kind" of voice message, and
-posts back a tailored summary using a per-kind prompt.
+Telegram bot that listens to voice messages and video notes, transcribes them
+(OpenAI `gpt-transcribe`, `whisper-1` for long voices), routes each one with
+the OpenAI Decisions API (GPT-6 Luna) to a summary format, and posts back a
+summary written in the chat's own style.
 
 The whole backend lives in [Convex](https://convex.dev) — there is no server
 to run, no Redis, no scheduler. Convex hosts the HTTP webhook, the database,
@@ -12,11 +13,16 @@ The Telegram side uses [grammY](https://grammy.dev)'s `Api` client.
 
 ## What you get
 
-- A Telegram bot that processes voice messages from groups it is added to.
-- An in-Telegram admin UI: **only the user whose ID you set** as
-  `ADMIN_TELEGRAM_ID` can run admin commands.
-- An end-to-end pipeline: download → Whisper transcription → GPT classifier →
-  per-type GPT summary → reply in chat with `[type] <summary>`.
+- A Telegram bot that processes voice messages from groups it is added to,
+  from chats it is summoned into by mention (guest mode), from Telegram
+  Business conversations, and from anyone's DM (forwarded voices).
+- Public DM use is rate-limited per user (`PUBLIC_DAILY_VOICE_LIMIT`,
+  `PUBLIC_MAX_DURATION_SEC`); `/start` explains the ways to use the bot.
+- Admin commands: **only the user whose ID you set** as `ADMIN_TELEGRAM_ID`
+  can run them. That user also gets a DM about failures worth acting on
+  (out of credits, bad key, outages) — throttled, never per voice.
+- An end-to-end pipeline: download → transcription → noise filter →
+  Decisions API router → summary in the chat's style → reply in chat.
 - A self-registering webhook (Convex cron + manual command).
 - Reply-based summarization: reply to **any** voice (even old ones) with
   `/summarize` and the bot will fetch and process it.
@@ -59,6 +65,8 @@ The Telegram side uses [grammY](https://grammy.dev)'s `Api` client.
    |---|---|---|
    | `OPENROUTER_API_KEY` | (unset) | Needed for the router and summarizer stages (both default to OpenRouter in `convex/models.ts`). Transcription always uses OpenAI. |
    | `ALLOWED_CHAT_IDS` | (all chats) | Comma-separated list of group/chat IDs the bot will process. If empty, the bot processes voices from any group it is in. |
+   | `PUBLIC_DAILY_VOICE_LIMIT` | `40` | Voices a non-admin user can send to the bot DM per 24 h. |
+   | `PUBLIC_MAX_DURATION_SEC` | `1800` | Longest voice a non-admin user can send to the bot DM. |
 
 4. Run the one-shot setup:
 
@@ -195,15 +203,15 @@ which model handled each stage, and per-stage timings.
 
 ### Changing models per stage
 
-The pipeline has three stages, each driven by a separately-configurable
-model. The transcribe/classify models and the summarizer catalog live in
-code — `convex/models.ts` — and change via redeploy, not via commands:
+The models live in code — `convex/models.ts` — and change via redeploy, not
+via commands:
 
 | Stage | Default | Notes |
 |---|---|---|
-| `transcribe` | `openai / whisper-1` | OpenAI only (OpenRouter has no audio endpoint). |
-| `classify` | `openrouter / grok` | JSON-mode router + /summary filter agent. |
-| `summarize` | `openrouter / gemini` | Per-chat pick from the catalog via `/settings` → model (or `/modal`). |
+| `transcribe` | `openai / gpt-transcribe` | Voices ≥ 5 min use `whisper-1` (segment timestamps for the sections mode); also the fallback. |
+| `decisions` | `openai / gpt-6-luna` | Decisions API: noise check, mode, context, speech act, "has tasks". Falls back to the legacy JSON router. |
+| `classify` | `openrouter / openai/gpt-6-luna` | /summary filter agent, Q&A and the legacy router. |
+| `summarize` | `openrouter / openai/gpt-6-luna` | Per-chat pick (GPT-6 Luna / Gemini 3.8 Flash / Grok 4.7) via `/settings` → model (or `/modal`). On failure the summary is retried once on another option. |
 
 Any stage pointed at `openrouter` requires `OPENROUTER_API_KEY` to be set in
 `.env.local` and re-pushed with `npm run setup`.
@@ -217,13 +225,27 @@ Any stage pointed at `openrouter` requires `OPENROUTER_API_KEY` to be set in
    `voiceMessages` row and schedules `processing.processVoiceMessage`.
 4. The processing pipeline:
    - calls Telegram `getFile` + downloads the audio,
-   - sends it to Whisper for transcription,
-   - asks `gpt-4o-mini` (in JSON mode) to pick one of your `voiceTypes`,
-   - calls `gpt-4o-mini` again with that type's `summaryPrompt`,
+   - transcribes it (see the models table) and drops known speech-to-text
+     hallucinations ("Thank you for watching.", subtitle credits, emoji-only)
+     without calling any model,
+   - asks the Decisions API whether it's noise and which mode / context /
+     speech act fits; hard rules on top: ≤ 320 chars → clean-up, ≥ 5 min →
+     sections, the owner's outgoing Business voice → first-person text,
+     list-like modes gated by length,
+   - summarizes with the chat's style notes, the speaker's name and what the
+     voice replies to (`voiceMessages.replyContext`, captured at ingest),
    - posts the summary back as a Telegram reply.
 
-If a step fails, the row's `status` becomes `error` and a short message is
-sent to the admin.
+If a step fails, the row's `status` becomes `error`, the chat sees a short
+human message, and the admin gets a throttled DM only for actionable or
+piling-up failures (`convex/failures.ts`, `adminAlerts` table).
+
+### Evaluating prompt changes
+
+`npm run eval:voice -- summaries <dataset.json> <out.json> [gemini,grok]`
+runs the same router and prompt builder (`convex/voicePolicy.ts`) on stored
+transcripts against the real APIs; `npm run eval:voice -- noise …` checks the
+noise filter. Datasets come from a Convex export and are not checked in.
 
 ## Voice-message kinds
 
@@ -255,17 +277,24 @@ convex/
   schema.ts         — voiceTypes, voiceMessages, adminState, botConfig tables
   http.ts           — /telegram webhook endpoint and /setup smoke endpoint
   bot.ts            — update dispatcher + admin command flow
-  processing.ts     — Whisper → classify → summarize → reply pipeline
+  processing.ts     — transcribe → route → summarize → reply pipeline
+  voicePolicy.ts    — noise filter, Decisions router questions, mode rules,
+                      summary request builder (pure; shared with the eval)
+  decisions.ts      — OpenAI Decisions API client
+  prompts.ts        — modes, contexts, speech acts, style/audience prompts
+  register.ts       — chat/speaker profanity register helpers
+  failures.ts       — failure classification + admin alert throttling rules
   voiceTypes.ts     — CRUD for voice-message types
   voiceMessages.ts  — CRUD for processed messages
   adminState.ts     — wizard-state storage for the admin
   botConfig.ts      — remembers last registered webhook URL/secret
   telegram.ts       — grammY-based Telegram API client
-  openai.ts         — Whisper + Chat Completions client
+  openai.ts         — transcription + Chat Completions client
   setup.ts          — registerWebhook + ensureWebhook (idempotent)
   crons.ts          — hourly self-heal of the Telegram webhook
 scripts/
   setup.mjs         — `npm run setup` — pushes env, deploys, registers webhook
+  eval/             — `npm run eval:voice` — offline voice pipeline eval
 ```
 
 ## Re-running setup

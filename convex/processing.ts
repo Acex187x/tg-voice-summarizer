@@ -2,40 +2,61 @@ import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import { internalAction } from "./_generated/server";
+import { decide } from "./decisions";
+import {
+  classifyFailure,
+  type Failure,
+  userFacingFailureText,
+} from "./failures";
 import {
   CLASSIFY_MODEL,
   CLASSIFY_PROVIDER,
+  DECISIONS_MODEL,
   SUMMARIZE_MODEL,
+  SECTIONS_MODEL_KEY,
+  SUMMARIZE_MODEL_OPTIONS,
   SUMMARIZE_PROVIDER,
   summarizeModelId,
   TRANSCRIBE_MODEL,
+  TRANSCRIBE_TIMESTAMPS_MODEL,
 } from "./models";
+import { chatComplete, chatCompleteStream, transcribeVoice } from "./openai";
 import {
-  chatComplete,
-  chatCompleteStream,
-  transcribeAudioWithTimestamps,
-} from "./openai";
-import {
+  type Audience,
   buildChatSummaryPrompt,
   buildFilterAgentSystemPrompt,
-  buildShortVoiceCleanTextPrompt,
-  buildSummaryPrompt,
   buildSummaryQaPrompt,
   type ContextKey,
   type Detail,
   type FilterDecision,
-  formatTimecode,
   formatTimestampedTranscript,
-  LONG_VOICE_SECTIONS_MIN_SEC,
   MEMORY_REFRESH_SYSTEM_PROMPT,
   type ModeKey,
   parseFilterResponse,
   parseRouterResponse,
-  parseVoiceNonsenseResponse,
   ROUTER_SYSTEM_PROMPT,
+  SPEECH_ACTS,
+  type SpeechActKey,
+  type SummaryExtras,
   type TimedSegment,
-  VOICE_NONSENSE_SYSTEM_PROMPT,
 } from "./prompts";
+import {
+  buildChatLogRouterQuestions,
+  buildRouterInput,
+  buildRouterQuestions,
+  buildVoiceSummaryRequest,
+  detectAsrNoise,
+  firstName,
+  gateMode,
+  interpretRouterAnswers,
+  isLongVoice,
+  isShortTranscript,
+  NOISE_PROBABILITY_THRESHOLD,
+  resolveAuto,
+  type RoutedVoice,
+  stripAsrTail,
+  voiceAudience,
+} from "./voicePolicy";
 import {
   deleteMessage,
   downloadFile,
@@ -62,16 +83,6 @@ import {
 } from "./telegram";
 import { semanticSearchMessages } from "./vectorSearch";
 
-const SHORT_TRANSCRIPT_CLEAN_TEXT_MAX_CHARS = 320;
-
-function transcriptLength(text: string): number {
-  return Array.from(text.replace(/\s+/g, " ").trim()).length;
-}
-
-function isShortTranscript(text: string): boolean {
-  const len = transcriptLength(text);
-  return len > 0 && len <= SHORT_TRANSCRIPT_CLEAN_TEXT_MAX_CHARS;
-}
 
 // ---- Lore loader ---------------------------------------------------------
 
@@ -130,25 +141,57 @@ async function isChatSummaryCancelled(
   return row?.cancelled === true;
 }
 
-async function classifyVoiceNonsense(
-  transcript: string,
-): Promise<{ shouldIgnore: boolean; reason: string }> {
+// ---- Failure reporting ----------------------------------------------------
+
+// Chat members get a short human message; the admin gets a DM only for
+// failures worth acting on, throttled per failure signature (see
+// failures.ts). Used by every voice entry point.
+export async function reportVoiceFailure(
+  ctx: { runMutation: any },
+  message: string,
+  where: string,
+): Promise<Failure> {
+  const failure = classifyFailure(message);
+  console.error(`${where} failed [${failure.kind}]`, message);
+  const adminIdRaw = process.env.ADMIN_TELEGRAM_ID;
+  if (!adminIdRaw) return failure;
   try {
-    const raw = await chatComplete({
-      provider: CLASSIFY_PROVIDER,
-      model: CLASSIFY_MODEL,
-      system: VOICE_NONSENSE_SYSTEM_PROMPT,
-      user: `Расшифровка голосового сообщения:\n"""\n${transcript}\n"""`,
-      temperature: 0,
-      jsonMode: true,
-    });
-    return parseVoiceNonsenseResponse(raw);
+    const { notify, count } = await ctx.runMutation(
+      internal.adminAlerts.noteFailure,
+      { key: failure.key, kind: failure.kind },
+    );
+    if (notify) {
+      await sendMessage(
+        Number(adminIdRaw),
+        `⚠️ ${where}: ${failure.kind}${count > 1 ? ` (×${count} за час)` : ""}\n${message.slice(0, 600)}\n\nТакие же ошибки следующие 6 ч присылать не буду.`,
+        {},
+      );
+    }
   } catch (err) {
     console.warn(
-      "Voice nonsense filter failed",
+      "admin alert failed",
       err instanceof Error ? err.message : String(err),
     );
-    return { shouldIgnore: false, reason: "filter failed" };
+  }
+  return failure;
+}
+
+// Progress edits are cosmetic: a deleted placeholder or Telegram flood
+// control must not fail the whole voice.
+async function softEdit(
+  chatId: number,
+  messageId: number | undefined,
+  text: string,
+  opts: Parameters<typeof editMessageText>[3] = {},
+): Promise<void> {
+  if (messageId === undefined) return;
+  try {
+    await editMessageText(chatId, messageId, text, opts);
+  } catch (err) {
+    console.warn(
+      "progress edit failed",
+      err instanceof Error ? err.message : String(err),
+    );
   }
 }
 
@@ -201,21 +244,58 @@ export const processVoiceMessage = internalAction({
         status: "transcribing",
       });
       if (await isVoiceCancelled(ctx, id)) return;
-      if (ackId !== undefined) {
-        await editMessageText(
-          responseChatId,
-          ackId,
-          `${loadingEmoji()}  <i>Расшифровываю сообщение…</i>`,
-          { parseMode: "HTML", inlineKeyboard: cancelKeyboard },
-        );
-      }
+      await softEdit(
+        responseChatId,
+        ackId,
+        `${loadingEmoji()}  <i>Расшифровываю сообщение…</i>`,
+        { parseMode: "HTML", inlineKeyboard: cancelKeyboard },
+      );
       const tStart = Date.now();
       const filePath = await getFilePath(record.fileId);
       const blob = await downloadFile(filePath);
-      const { text: transcript, segments } =
-        await transcribeAudioWithTimestamps(blob, TRANSCRIBE_MODEL, "voice.ogg");
+      const transcribed = await transcribeVoice(
+        blob,
+        filePath,
+        record.mediaKind,
+        record.durationSec,
+      );
+      const transcript = stripAsrTail(transcribed.text);
+      const segments = transcribed.segments;
       timings.transcribeMs = Date.now() - tStart;
-      if (!transcript) throw new Error("Whisper returned empty transcript");
+
+      // Silence, music, Whisper's "Thank you for watching." — nothing to
+      // summarize and nothing worth bothering anyone about.
+      const ignoreVoice = async (reason: string) => {
+        await ctx.runMutation(internal.voiceMessages.setStatus, {
+          id,
+          status: "ignored",
+          error: reason,
+        });
+        if (ackId !== undefined) {
+          await deleteMessage(responseChatId, ackId).catch(() => {});
+        }
+        // No business delivery here even if "Отправить собеседнику" was
+        // queued: the only thing to send would be the ASR junk itself.
+        // Silent-instant: drop the "processing" reaction; nothing will be
+        // posted.
+        if (record.delivery === "instantSilent" && !isBusinessPrivateResult) {
+          await setMessageReaction(record.chatId, record.messageId).catch(
+            () => {},
+          );
+        }
+      };
+      const noiseReason = detectAsrNoise(transcript);
+      if (noiseReason) {
+        if (transcript) {
+          await ctx.runMutation(internal.voiceMessages.setTranscript, {
+            id,
+            transcript,
+            segments,
+          });
+        }
+        await ignoreVoice(noiseReason);
+        return;
+      }
       await ctx.runMutation(internal.voiceMessages.setTranscript, {
         id,
         transcript,
@@ -260,9 +340,8 @@ export const processVoiceMessage = internalAction({
         );
       }
       if (await isVoiceCancelled(ctx, id)) return;
-      const nonsensePromise = classifyVoiceNonsense(transcript);
 
-      // ---- 2. Resolve chat settings + router --------------------------
+      // ---- 2. Resolve chat settings + router (+ model noise check) ----
       const chatSettings = chatSettingsEarly;
 
       const resolved = await resolveVoiceSettings(
@@ -273,26 +352,10 @@ export const processVoiceMessage = internalAction({
         record.durationSec,
       );
       timings.routerMs = resolved.routerMs;
-      const nonsense = await nonsensePromise;
-      if (nonsense.shouldIgnore) {
-        await ctx.runMutation(internal.voiceMessages.setStatus, {
-          id,
-          status: "ignored",
-          error: nonsense.reason,
-        });
-        if (ackId !== undefined) {
-          await deleteMessage(responseChatId, ackId);
-        }
-        // A queued "Отправить собеседнику" still deserves a delivery —
-        // there's no summary for a nonsense-filtered voice, so the peer
-        // gets the transcript instead.
-        await maybeDeliverBusinessSummary(ctx, record, null, transcript);
-        // Silent-instant: drop the "processing" reaction; nothing will be
-        // posted. (On-demand keeps its reaction — the transcript is still
-        // servable ephemerally.)
-        if (record.delivery === "instantSilent" && !isBusinessPrivateResult) {
-          await setMessageReaction(record.chatId, record.messageId);
-        }
+      if (resolved.noiseProbability >= NOISE_PROBABILITY_THRESHOLD) {
+        await ignoreVoice(
+          `router: is_noise=${resolved.noiseProbability.toFixed(2)}`,
+        );
         return;
       }
 
@@ -302,17 +365,15 @@ export const processVoiceMessage = internalAction({
         status: "summarizing",
       });
       if (await isVoiceCancelled(ctx, id)) return;
-      if (ackId !== undefined) {
-        await editMessageText(
-          responseChatId,
-          ackId,
-          `${loadingEmoji()} <i>Готовлю summary…</i>`,
-          {
-            parseMode: "HTML",
-            inlineKeyboard: await freshCancelKeyboard(),
-          },
-        );
-      }
+      await softEdit(
+        responseChatId,
+        ackId,
+        `${loadingEmoji()} <i>Готовлю summary…</i>`,
+        {
+          parseMode: "HTML",
+          inlineKeyboard: await freshCancelKeyboard(),
+        },
+      );
       const sStart = Date.now();
       const memory = await ctx.runQuery(internal.chatMemory.get, {
         chatId: record.chatId,
@@ -436,36 +497,28 @@ export const processVoiceMessage = internalAction({
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error("Voice processing failed", message);
       await ctx.runMutation(internal.voiceMessages.setStatus, {
         id,
         status: "error",
         error: message,
       });
+      // A cancelled voice that blew up mid-flight is nobody's problem.
+      if (await isVoiceCancelled(ctx, id)) return;
+      const failure = await reportVoiceFailure(ctx, message, "Войс");
 
       if (ackId !== undefined) {
         await editMessageText(
           responseChatId,
           ackId,
-          `Не удалось обработать сообщение: ${message}`,
+          userFacingFailureText(failure.kind),
         ).catch(() => {});
       }
       // Silent-instant used the reaction as its "processing" indicator —
       // don't leave it hanging on a voice we failed to process.
       if (record.delivery === "instantSilent") {
-        await setMessageReaction(record.chatId, record.messageId);
-      }
-      const adminIdRaw = process.env.ADMIN_TELEGRAM_ID;
-      if (adminIdRaw) {
-        try {
-          await sendMessage(
-            Number(adminIdRaw),
-            `Ошибка обработки голосового:\n${message}`,
-            {},
-          );
-        } catch {
-          // ignore
-        }
+        await setMessageReaction(record.chatId, record.messageId).catch(
+          () => {},
+        );
       }
     }
   },
@@ -652,89 +705,17 @@ interface ResolvedSettings {
   context: Exclude<ContextKey, "auto">;
   detail: Detail;
   routerMs: number;
+  speechAct: SpeechActKey | null;
+  // Router's probability that the transcript is ASR noise. 0 when the
+  // router didn't run (cached resolution, explicit settings + cache).
+  noiseProbability: number;
 }
 
-// Resolves (possibly-"auto") chat settings to concrete mode+context keys.
-// The router result is cached on the voiceMessages row so we don't pay for
-// it again on cache misses for different (detail, explicit mode) combos.
-export async function resolveVoiceSettings(
-  ctx: { runQuery: any; runMutation: any },
-  voiceId: Id<"voiceMessages">,
+// Legacy JSON-mode router, kept as a fallback for Decisions API outages.
+async function legacyRoute(
   transcript: string,
-  settings: { mode: ModeKey; context: ContextKey; detail: Detail },
-  durationSec?: number,
-): Promise<ResolvedSettings> {
-  let mode: ModeKey = settings.mode;
-  let context: ContextKey = settings.context;
-
-  if (isShortTranscript(transcript)) {
-    const forcedContext =
-      context === "auto"
-        ? "thinkingOutLoud"
-        : (context as Exclude<ContextKey, "auto">);
-    await ctx.runMutation(internal.voiceMessages.setAutoResolution, {
-      id: voiceId,
-      autoMode: "cleanText",
-      autoContext: forcedContext,
-    });
-    return {
-      mode: "cleanText",
-      context: forcedContext,
-      detail: settings.detail,
-      routerMs: 0,
-    };
-  }
-
-  // Long voices default to the sectioned per-topic summary. Only kicks in
-  // for "auto" — an explicit mode choice always wins. The forced value is
-  // stored as the auto resolution so the DM picker shows "Авто → Темы"
-  // consistently with what the chat message displays.
-  const forceSections =
-    mode === "auto" && (durationSec ?? 0) >= LONG_VOICE_SECTIONS_MIN_SEC;
-  if (forceSections) {
-    mode = "sections";
-    if (context !== "auto") {
-      await ctx.runMutation(internal.voiceMessages.setAutoResolution, {
-        id: voiceId,
-        autoMode: "sections",
-        autoContext: context,
-      });
-    }
-  }
-
-  // Fast path: nothing to resolve.
-  if (mode !== "auto" && context !== "auto") {
-    return {
-      mode: mode as Exclude<ModeKey, "auto">,
-      context: context as Exclude<ContextKey, "auto">,
-      detail: settings.detail,
-      routerMs: 0,
-    };
-  }
-
-  // Reuse previously-computed auto resolution if it exists on the row.
-  const existing = await ctx.runQuery(internal.voiceMessages.get, {
-    id: voiceId,
-  });
-  if (existing?.autoMode && existing?.autoContext) {
-    if (mode === "auto") mode = existing.autoMode as ModeKey;
-    if (context === "auto") context = existing.autoContext as ContextKey;
-    if (mode !== "auto" && context !== "auto") {
-      return {
-        mode: mode as Exclude<ModeKey, "auto">,
-        context: context as Exclude<ContextKey, "auto">,
-        detail: settings.detail,
-        routerMs: 0,
-      };
-    }
-  }
-
-  // Run the router.
-  await ctx.runMutation(internal.voiceMessages.setStatus, {
-    id: voiceId,
-    status: "routing",
-  });
-  const rStart = Date.now();
+  facts: { durationSec?: number | null; transcriptLength: number },
+): Promise<RoutedVoice> {
   const raw = await chatComplete({
     provider: CLASSIFY_PROVIDER,
     model: CLASSIFY_MODEL,
@@ -744,24 +725,122 @@ export async function resolveVoiceSettings(
     jsonMode: true,
   });
   const routed = parseRouterResponse(raw);
+  return {
+    mode: gateMode(routed.mode, { ...facts, hasTasksProbability: null }),
+    context: routed.context,
+    speechAct: "inform",
+    noiseProbability: 0,
+  };
+}
+
+// Resolves (possibly-"auto") chat settings to concrete mode+context keys.
+// The router result is cached on the voiceMessages row so we don't pay for
+// it again on cache misses for different (detail, explicit mode) combos.
+//
+// Routing is a single Decisions API call (GPT-6 Luna) asking typed
+// questions: is this noise, which mode, which context, what the speaker
+// wants, are there real tasks. Hard rules sit on top: short transcripts
+// are cleaned up, long voices get sections, an owner's outgoing business
+// voice is rewritten first-person, and dicing modes are gated by length.
+export async function resolveVoiceSettings(
+  ctx: { runQuery: any; runMutation: any },
+  voiceId: Id<"voiceMessages">,
+  transcript: string,
+  settings: { mode: ModeKey; context: ContextKey; detail: Detail },
+  durationSec?: number,
+): Promise<ResolvedSettings> {
+  let mode: ModeKey = settings.mode;
+  let context: ContextKey = settings.context;
+  const voice = (await ctx.runQuery(internal.voiceMessages.get, {
+    id: voiceId,
+  })) as Doc<"voiceMessages"> | null;
+  const cachedAct =
+    voice?.autoSpeechAct && voice.autoSpeechAct in SPEECH_ACTS
+      ? (voice.autoSpeechAct as SpeechActKey)
+      : null;
+
+  // Reuse a previously-computed auto resolution (picker re-renders etc.).
+  if (voice?.autoMode && voice?.autoContext) {
+    if (mode === "auto") mode = voice.autoMode as ModeKey;
+    if (context === "auto") context = voice.autoContext as ContextKey;
+    if (mode !== "auto" && context !== "auto") {
+      return {
+        mode: mode as Exclude<ModeKey, "auto">,
+        context: context as Exclude<ContextKey, "auto">,
+        detail: settings.detail,
+        routerMs: 0,
+        speechAct: cachedAct,
+        noiseProbability: 0,
+      };
+    }
+  }
+
+  const short = isShortTranscript(transcript);
+  const long = isLongVoice(durationSec);
+  const audience = voiceAudience(voice ?? {});
+  const facts = { durationSec, transcriptLength: transcript.length };
+  const needsRouting = !short && (mode === "auto" || context === "auto");
+
+  if (needsRouting) {
+    await ctx.runMutation(internal.voiceMessages.setStatus, {
+      id: voiceId,
+      status: "routing",
+    });
+  }
+  const rStart = Date.now();
+  let routed: RoutedVoice | null = null;
+  const questions = buildRouterQuestions().filter(
+    (q) => needsRouting || q.name === "is_noise" || q.name === "speech_act",
+  );
+  try {
+    const result = await decide(
+      buildRouterInput({
+        transcript,
+        durationSec,
+        mediaKind: voice?.mediaKind,
+        replyContext: voice?.replyContext,
+        audience,
+      }),
+      questions,
+    );
+    routed = interpretRouterAnswers(result, facts);
+  } catch (err) {
+    console.warn(
+      "Decisions router failed, using legacy router",
+      err instanceof Error ? err.message : String(err),
+    );
+    if (needsRouting) routed = await legacyRoute(transcript, facts);
+  }
   const routerMs = Date.now() - rStart;
+
+  const { autoMode, autoContext } = resolveAuto({
+    short,
+    long,
+    audience,
+    routed: needsRouting ? routed : null,
+  });
+  const speechAct = routed?.speechAct ?? cachedAct;
 
   await ctx.runMutation(internal.voiceMessages.setAutoResolution, {
     id: voiceId,
-    // When sections mode was duration-forced, that's what "auto" resolves
-    // to for this voice — not whatever the router would have picked.
-    autoMode: forceSections ? "sections" : routed.mode,
-    autoContext: routed.context,
+    autoMode,
+    autoContext,
+    autoSpeechAct: speechAct ?? undefined,
   });
 
   return {
-    mode: mode === "auto" ? routed.mode : (mode as Exclude<ModeKey, "auto">),
+    // Short transcripts are always cleaned up, whatever the chat default.
+    mode: short
+      ? "cleanText"
+      : mode === "auto"
+        ? autoMode
+        : (mode as Exclude<ModeKey, "auto">),
     context:
-      context === "auto"
-        ? routed.context
-        : (context as Exclude<ContextKey, "auto">),
+      context === "auto" ? autoContext : (context as Exclude<ContextKey, "auto">),
     detail: settings.detail,
     routerMs,
+    speechAct,
+    noiseProbability: routed?.noiseProbability ?? 0,
   };
 }
 
@@ -823,49 +902,95 @@ export async function getOrGenerateSummaryStreaming(
   return { text, cached: false };
 }
 
+// Speaker/audience facts for the prompt, read off the voice row so every
+// caller (pipeline, picker, guest mode, apply-to-chat) gets them without
+// threading extra args.
+async function loadSummaryExtras(
+  ctx: { runQuery: any },
+  voice: Doc<"voiceMessages"> | null,
+): Promise<SummaryExtras> {
+  if (!voice) return {};
+  const audience = voiceAudience(voice);
+  let speakerName = firstName(voice.forwardedFromName ?? voice.fromName);
+  if (voice.fromId !== undefined && voice.chatId < 0) {
+    const nick = await ctx.runQuery(internal.chatNicknames.getForUser, {
+      chatId: voice.chatId,
+      userId: voice.fromId,
+    });
+    if (nick?.nickname) speakerName = nick.nickname;
+  }
+  let peerName: string | null = null;
+  if (voice.businessConnectionId) {
+    const conv = await ctx.runQuery(internal.businessChatSettings.get, {
+      connectionId: voice.businessConnectionId,
+      peerChatId: voice.chatId,
+    });
+    peerName = firstName(conv?.peerName);
+  }
+  return {
+    audience,
+    speakerName,
+    peerName,
+    replyContext: voice.replyContext ?? null,
+    speechAct:
+      voice.autoSpeechAct && voice.autoSpeechAct in SPEECH_ACTS
+        ? (voice.autoSpeechAct as SpeechActKey)
+        : null,
+    forwarded: voice.forwardedFromName !== undefined,
+  };
+}
+
+// The other summarizer option, used once when the chat's model fails.
+function fallbackSummarizeModel(modelId: string): string {
+  const other = Object.values(SUMMARIZE_MODEL_OPTIONS).find(
+    (o) => o.id !== modelId,
+  );
+  return other?.id ?? SUMMARIZE_MODEL;
+}
+
 async function generateAndCacheSummary(
   ctx: { runQuery: any; runMutation: any },
   voiceId: Id<"voiceMessages">,
   args: GenerateArgs,
   onPartial?: (text: string) => Promise<void>,
 ): Promise<string> {
-  const useShortCleanup =
-    args.mode === "cleanText" && isShortTranscript(args.transcript);
-  const system = useShortCleanup
-    ? buildShortVoiceCleanTextPrompt()
-    : buildSummaryPrompt(
-        args.mode,
-        args.context,
-        args.detail,
-        args.chatStyleNotes ?? null,
-        args.chatLore ?? null,
-      );
-  // The sections mode needs timestamps to anchor topics to; other modes
-  // get the plain transcript (timestamps would only burn tokens there).
-  const useTimestamps =
-    args.mode === "sections" && (args.segments?.length ?? 0) > 0;
-  const transcriptBlock = useTimestamps
-    ? formatTimestampedTranscript(args.segments!)
-    : args.transcript;
-  const durationLine =
-    useTimestamps && args.durationSec
-      ? `Длительность аудио: ${formatTimecode(args.durationSec)}\n`
-      : "";
+  const voice = (await ctx.runQuery(internal.voiceMessages.get, {
+    id: voiceId,
+  })) as Doc<"voiceMessages"> | null;
+  const extras = await loadSummaryExtras(ctx, voice);
+  const model =
+    args.mode === "sections"
+      ? summarizeModelId(SECTIONS_MODEL_KEY)
+      : (args.modelId ?? SUMMARIZE_MODEL);
+  const request = buildVoiceSummaryRequest(args, extras);
   const completionArgs = {
     provider: SUMMARIZE_PROVIDER,
-    model: args.modelId ?? SUMMARIZE_MODEL,
-    system,
-    user: `${durationLine}Расшифровка:\n"""\n${transcriptBlock}\n"""`,
-    temperature: useShortCleanup ? 0.2 : 0.4,
+    model,
+    system: request.system,
+    user: request.user,
+    temperature: request.temperature,
   };
-  const text = onPartial
-    ? await chatCompleteStream({
-        ...completionArgs,
-        onDelta: async (_delta, full) => {
-          await onPartial(full);
-        },
-      })
-    : await chatComplete(completionArgs);
+  let text: string;
+  try {
+    text = onPartial
+      ? await chatCompleteStream({
+          ...completionArgs,
+          onDelta: async (_delta, full) => {
+            await onPartial(full);
+          },
+        })
+      : await chatComplete(completionArgs);
+    if (!text) throw new Error(`Summary model returned empty response (model=${model})`);
+  } catch (err) {
+    // One retry on the other summarizer: provider hiccups shouldn't cost
+    // the chat a summary.
+    const fallback = fallbackSummarizeModel(model);
+    console.warn(
+      `summary via ${model} failed, retrying with ${fallback}`,
+      err instanceof Error ? err.message : String(err),
+    );
+    text = await chatComplete({ ...completionArgs, model: fallback });
+  }
   if (!text) throw new Error("Summary model returned empty response");
   await ctx.runMutation(internal.summaries.store, {
     voiceMessageId: voiceId,
@@ -922,8 +1047,8 @@ export function renderFinal(args: RenderArgs): RenderedMessage {
     quoteLines.push(`<b>Контекст:</b> ${escapeHtml(ctxLabel)}`);
     quoteLines.push(`<b>Детальность:</b> ${args.detail}`);
     quoteLines.push(
-      `<b>Модели:</b> transcribe=openai/${escapeHtml(TRANSCRIBE_MODEL)}, ` +
-        `router=${escapeHtml(CLASSIFY_PROVIDER)}/${escapeHtml(CLASSIFY_MODEL)}, ` +
+      `<b>Модели:</b> transcribe=openai/${escapeHtml(TRANSCRIBE_MODEL)} (длинные: ${escapeHtml(TRANSCRIBE_TIMESTAMPS_MODEL)}), ` +
+        `router=openai/${escapeHtml(DECISIONS_MODEL)} (Decisions API), ` +
         `summary=${escapeHtml(SUMMARIZE_PROVIDER)}/${escapeHtml(SUMMARIZE_MODEL)}`,
     );
     quoteLines.push(`<b>Время:</b> ${formatTimings(args.timings)}`);
@@ -964,7 +1089,7 @@ function buildVoiceRichMarkdown(args: RenderArgs): string | undefined {
         `**Стиль:** ${modeLabel}`,
         `**Контекст:** ${ctxLabel}`,
         `**Детальность:** ${args.detail}`,
-        `**Модели:** transcribe=openai/${TRANSCRIBE_MODEL}, router=${CLASSIFY_PROVIDER}/${CLASSIFY_MODEL}, summary=${SUMMARIZE_PROVIDER}/${SUMMARIZE_MODEL}`,
+        `**Модели:** transcribe=openai/${TRANSCRIBE_MODEL} (длинные: ${TRANSCRIBE_TIMESTAMPS_MODEL}), router=openai/${DECISIONS_MODEL} (Decisions API), summary=${SUMMARIZE_PROVIDER}/${SUMMARIZE_MODEL}`,
         `**Время:** ${formatTimings(args.timings)}`,
         "",
         `</details>`,
@@ -1880,15 +2005,35 @@ async function resolveChatSummarySettings(
       };
     }
   }
-  const raw = await chatComplete({
-    provider: CLASSIFY_PROVIDER,
-    model: CLASSIFY_MODEL,
-    system: ROUTER_SYSTEM_PROMPT,
-    user: `Лог переписки в чате:\n"""\n${chatLog}\n"""`,
-    temperature: 0,
-    jsonMode: true,
-  });
-  const routed = parseRouterResponse(raw);
+  let routed: {
+    mode: Exclude<ModeKey, "auto">;
+    context: Exclude<ContextKey, "auto">;
+  };
+  try {
+    const result = await decide(
+      `Лог переписки в чате:\n"""\n${chatLog}\n"""`,
+      buildChatLogRouterQuestions(),
+    );
+    routed = interpretRouterAnswers(result, {
+      durationSec: null,
+      // Chat logs are never "short replies": skip the length gating.
+      transcriptLength: Number.MAX_SAFE_INTEGER,
+    });
+  } catch (err) {
+    console.warn(
+      "Decisions chat router failed, using legacy router",
+      err instanceof Error ? err.message : String(err),
+    );
+    const raw = await chatComplete({
+      provider: CLASSIFY_PROVIDER,
+      model: CLASSIFY_MODEL,
+      system: ROUTER_SYSTEM_PROMPT,
+      user: `Лог переписки в чате:\n"""\n${chatLog}\n"""`,
+      temperature: 0,
+      jsonMode: true,
+    });
+    routed = parseRouterResponse(raw);
+  }
   await ctx.runMutation(internal.chatSummaries.setAutoResolution, {
     id: summaryId,
     autoMode: routed.mode,
@@ -2002,7 +2147,7 @@ export function renderChatSummaryFinal(
       `<b>Стиль:</b> ${escapeHtml(modeLabel)}`,
       `<b>Контекст:</b> ${escapeHtml(ctxLabel)}`,
       `<b>Детальность:</b> ${args.detail}`,
-      `<b>Модели:</b> router=${escapeHtml(CLASSIFY_PROVIDER)}/${escapeHtml(CLASSIFY_MODEL)}, ` +
+      `<b>Модели:</b> router=openai/${escapeHtml(DECISIONS_MODEL)} (Decisions API), ` +
         `summary=${escapeHtml(SUMMARIZE_PROVIDER)}/${escapeHtml(SUMMARIZE_MODEL)}`,
     ];
     body += `\n\n<blockquote expandable>${debugLines.join("\n")}</blockquote>`;
@@ -2037,7 +2182,7 @@ export function renderChatSummaryFinal(
         `**Стиль:** ${modeLabel}`,
         `**Контекст:** ${ctxLabel}`,
         `**Детальность:** ${args.detail}`,
-        `**Модели:** router=${CLASSIFY_PROVIDER}/${CLASSIFY_MODEL}, summary=${SUMMARIZE_PROVIDER}/${SUMMARIZE_MODEL}`,
+        `**Модели:** router=openai/${DECISIONS_MODEL} (Decisions API), summary=${SUMMARIZE_PROVIDER}/${SUMMARIZE_MODEL}`,
         "",
         `</details>`,
       ].join("\n"),
