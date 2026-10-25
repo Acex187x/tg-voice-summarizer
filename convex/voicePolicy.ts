@@ -371,6 +371,22 @@ export function firstName(name: string | null | undefined): string | null {
   return n ? n.split(/\s+/)[0] : null;
 }
 
+// ---- Output cleanup -------------------------------------------------------
+
+// Grok appends crisis-line asides ("Если тяжело — 988.") to dark voices
+// even when told not to. The owner wants the chat's vibe kept as is, and
+// a US hotline is wrong for these chats anyway, so such lines are dropped.
+const HOTLINE_LINE_RE =
+  /(\b988\b|телефон(ы)? доверия|телефон(и)? довіри|гаряч(ую|а) лінію|горяч(ую|ая) лини|lifeline|crisis line|hotline)/i;
+
+export function stripUnwantedAsides(text: string): string {
+  const lines = text.split("\n");
+  const kept = lines.filter(
+    (l) => !(HOTLINE_LINE_RE.test(l) && l.trim().length < 160),
+  );
+  return kept.length === lines.length ? text : kept.join("\n").trim();
+}
+
 // ---- Summary request ------------------------------------------------------
 
 export interface VoiceSummaryArgs {

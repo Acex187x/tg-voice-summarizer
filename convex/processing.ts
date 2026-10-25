@@ -55,6 +55,7 @@ import {
   resolveAuto,
   type RoutedVoice,
   stripAsrTail,
+  stripUnwantedAsides,
   voiceAudience,
 } from "./voicePolicy";
 import {
@@ -991,6 +992,7 @@ async function generateAndCacheSummary(
     );
     text = await chatComplete({ ...completionArgs, model: fallback });
   }
+  text = stripUnwantedAsides(text);
   if (!text) throw new Error("Summary model returned empty response");
   await ctx.runMutation(internal.summaries.store, {
     voiceMessageId: voiceId,

@@ -29,6 +29,7 @@ import {
   NOISE_PROBABILITY_THRESHOLD,
   resolveAuto,
   stripAsrTail,
+  stripUnwantedAsides,
   voiceAudience,
 } from "../../convex/voicePolicy";
 
@@ -167,7 +168,7 @@ async function runSummaries(items: EvalItem[], models: SummarizeModelKey[]) {
             console.warn(`  ${item.id} ${model} attempt ${attempt + 1}:`, String(err).slice(0, 200));
           }
         }
-        outputs[key] = { text, ms: Date.now() - t0, model };
+        outputs[key] = { text: stripUnwantedAsides(text), ms: Date.now() - t0, model };
       }
       console.log(
         `[${i + 1}/${items.length}] ${item.id} ${r.mode}/${r.context}/${r.routed.speechAct} noise=${r.routed.noiseProbability.toFixed(2)}`,
