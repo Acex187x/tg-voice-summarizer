@@ -365,10 +365,12 @@ export function voiceAudience(voice: AudienceFacts): Audience {
   return viaPipeline ? "group" : "guest";
 }
 
-// "Ilya @Acex187x" → "Ilya".
+// "Ilya @Acex187x" → "Ilya". Names without letters ("." is a real
+// Telegram first name) count as no name.
 export function firstName(name: string | null | undefined): string | null {
   const n = name?.replace(/@\w+/g, "").trim();
-  return n ? n.split(/\s+/)[0] : null;
+  const first = n ? n.split(/\s+/)[0] : null;
+  return first && /\p{L}/u.test(first) ? first : null;
 }
 
 // ---- Output cleanup -------------------------------------------------------
