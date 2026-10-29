@@ -74,7 +74,7 @@ export async function transcribeAudioWithTimestamps(
   audio: Blob,
   model: string,
   filename = "voice.ogg",
-  opts: { prompt?: string } = {},
+  opts: { prompt?: string; timeoutMs?: number } = {},
 ): Promise<TranscriptionResult> {
   const key = getOpenAIKey();
   const wantTimestamps = model.startsWith("whisper");
@@ -92,6 +92,9 @@ export async function transcribeAudioWithTimestamps(
     method: "POST",
     headers: { Authorization: `Bearer ${key}` },
     body: form,
+    // A hung request must not outlive the action's 10-minute limit,
+    // or the voice is left "transcribing" with no error recorded.
+    signal: AbortSignal.timeout(opts.timeoutMs ?? 240_000),
   });
   if (!res.ok) {
     const errText = await res.text();
@@ -135,11 +138,36 @@ export async function transcribeAudioWithTimestamps(
   return { text: (json.text ?? "").trim(), segments };
 }
 
+// The audio endpoint picks the decoder from the filename and rejects a
+// mismatch, and Telegram's extension can lie (a "voice/file_1.mp3" that is
+// really M4A/AAC). So the container is read from the file's magic bytes;
+// the extension is only a fallback.
+function sniffAudioExt(head: Uint8Array, mediaKind?: string): string | null {
+  const ascii = (from: number, to: number) =>
+    String.fromCharCode(...head.slice(from, to));
+  if (ascii(0, 4) === "OggS") return "ogg";
+  if (ascii(4, 8) === "ftyp") {
+    return ascii(8, 11) === "M4A" || mediaKind !== "video_note" ? "m4a" : "mp4";
+  }
+  if (ascii(0, 3) === "ID3") return "mp3";
+  if (head[0] === 0xff && (head[1] & 0xe0) === 0xe0) return "mp3";
+  if (ascii(0, 4) === "RIFF") return "wav";
+  if (ascii(0, 4) === "fLaC") return "flac";
+  if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3)
+    return "webm";
+  return null;
+}
+
 // Telegram file paths look like "voice/file_12.oga" or
-// "video_notes/file_3.mp4" (sometimes without an extension). The audio
-// endpoint picks the decoder from the filename, and gpt-transcribe accepts
-// ".ogg" but not ".oga".
-export function audioFilename(filePath: string, mediaKind?: string): string {
+// "video_notes/file_3.mp4" (sometimes without an extension), and
+// gpt-transcribe accepts ".ogg" but not ".oga".
+export function audioFilename(
+  filePath: string,
+  mediaKind?: string,
+  head?: Uint8Array,
+): string {
+  const sniffed = head ? sniffAudioExt(head, mediaKind) : null;
+  if (sniffed) return `voice.${sniffed}`;
   const ext = filePath.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
   if (ext === "oga" || ext === "opus") return "voice.ogg";
   if (ext && ["ogg", "mp3", "mp4", "m4a", "wav", "webm", "mpeg", "mpga", "flac"].includes(ext)) {
@@ -158,12 +186,14 @@ export async function transcribeVoice(
   mediaKind?: string,
   durationSec?: number | null,
 ): Promise<TranscriptionResult> {
-  const filename = audioFilename(filePath, mediaKind);
+  const head = new Uint8Array(await audio.slice(0, 12).arrayBuffer());
+  const filename = audioFilename(filePath, mediaKind, head);
   if ((durationSec ?? 0) >= LONG_VOICE_SECTIONS_MIN_SEC) {
     return await transcribeAudioWithTimestamps(
       audio,
       TRANSCRIBE_TIMESTAMPS_MODEL,
       filename,
+      { timeoutMs: 420_000 },
     );
   }
   try {
@@ -171,7 +201,7 @@ export async function transcribeVoice(
       audio,
       TRANSCRIBE_MODEL,
       filename,
-      { prompt: TRANSCRIBE_PROMPT },
+      { prompt: TRANSCRIBE_PROMPT, timeoutMs: 150_000 },
     );
   } catch (err) {
     console.warn(
