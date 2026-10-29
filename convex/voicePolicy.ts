@@ -121,14 +121,37 @@ export function stripAsrTail(transcript: string): string {
 // hallucinations the rules missed scored 0.6–1.0.
 export const NOISE_PROBABILITY_THRESHOLD = 0.8;
 
+// Threshold on `is_music`, asked only for audio files: almost every audio
+// file sent to the chats is a song, while lectures and recordings arrive as
+// voices. A song is "speech with words" for `is_noise`, so it needs its own
+// question. Calibrated on 54 audio transcripts: 19 songs (with and without
+// tags) scored 0.83–1.0; 35 talks sent as files (lectures, long voices,
+// "Новая запись", a podcast-tagged lecture) scored 0.
+export const MUSIC_PROBABILITY_THRESHOLD = 0.7;
+
 // ---- Router ---------------------------------------------------------------
 
 export interface RouterInput {
   transcript: string;
   durationSec?: number | null;
   mediaKind?: string | null;
+  // Audio files only: "performer — title" / file name from Telegram.
+  audioTrack?: string | null;
   replyContext?: string | null;
   audience: Audience;
+}
+
+// Telegram's own tags for an audio file, as one line for the router.
+export function audioTrackLabel(audio: {
+  performer?: string;
+  title?: string;
+  file_name?: string;
+}): string | undefined {
+  const tags = [audio.performer, audio.title]
+    .map((s) => s?.trim())
+    .filter(Boolean)
+    .join(" — ");
+  return (tags || audio.file_name?.trim() || undefined)?.slice(0, 200);
 }
 
 // Modes the router may pick. "sections" is duration-driven, never routed.
@@ -159,6 +182,7 @@ const MODE_ROUTER_HINTS: Record<(typeof ROUTABLE_MODES)[number], string> = {
 export function buildRouterInput(r: RouterInput): string {
   const meta: string[] = [];
   if (r.mediaKind) meta.push(`Тип: ${r.mediaKind === "video_note" ? "видеокружок" : r.mediaKind === "audio" ? "аудиофайл" : "голосовое"}`);
+  if (r.audioTrack) meta.push(`Теги файла: «${r.audioTrack}»`);
   if (r.durationSec) meta.push(`Длительность: ${Math.round(r.durationSec)} с`);
   meta.push(`Символов в расшифровке: ${r.transcript.length}`);
   const where: Record<Audience, string> = {
@@ -175,8 +199,18 @@ export function buildRouterInput(r: RouterInput): string {
   return `${meta.join(" · ")}\n${reply}\nРасшифровка (speech-to-text, возможны ошибки распознавания):\n"""\n${r.transcript}\n"""`;
 }
 
-export function buildRouterQuestions(): DecisionQuestion[] {
+const IS_MUSIC_QUESTION: DecisionQuestion = {
+  type: "predicate",
+  name: "is_music",
+  instructions:
+    "Верно ли, что этот аудиофайл — музыкальный трек: песня, рэп, кавер, инструментал, запись концерта (куплеты, припев, повторы строк, рифма, «MUSIC» в расшифровке), — а не человек, который что-то говорит слушателям? Нет — если это лекция, подкаст, интервью, запись разговора или совещания, диктофонная заметка, голосовое, пересланное файлом. Теги исполнителя и названия песни — сильный признак музыки; подкаст или лекция с тегами — не музыка.",
+};
+
+export function buildRouterQuestions(
+  opts: { audioFile?: boolean } = {},
+): DecisionQuestion[] {
   return [
+    ...(opts.audioFile ? [IS_MUSIC_QUESTION] : []),
     {
       type: "predicate",
       name: "is_noise",
@@ -226,6 +260,14 @@ export interface RoutedVoice {
   context: Exclude<ContextKey, "auto">;
   speechAct: SpeechActKey;
   noiseProbability: number;
+  // Present only when `is_music` was asked (audio files).
+  musicProbability: number;
+}
+
+// Router questions every first-run voice gets, even when mode and context
+// are already fixed by the chat settings.
+export function isFilterQuestion(name: string): boolean {
+  return name === "is_noise" || name === "is_music" || name === "speech_act";
 }
 
 // Safety net on top of the router: the eval showed actionItems/keyPoints
@@ -276,6 +318,7 @@ export function interpretRouterAnswers(
     context,
     speechAct,
     noiseProbability: predicate(result, "is_noise") ?? 0,
+    musicProbability: predicate(result, "is_music") ?? 0,
   };
 }
 

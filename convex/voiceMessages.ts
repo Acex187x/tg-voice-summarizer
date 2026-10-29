@@ -83,6 +83,8 @@ export const create = internalMutation({
     businessOutgoing: v.optional(v.boolean()),
     replyContext: v.optional(v.string()),
     forwardedFromName: v.optional(v.string()),
+    audioTrack: v.optional(v.string()),
+    summoned: v.optional(v.boolean()),
     delivery: v.optional(
       v.union(
         v.literal("instant"),
@@ -111,9 +113,10 @@ export const setDelivery = internalMutation({
       v.literal("instantSilent"),
       v.literal("onDemand"),
     ),
+    summoned: v.optional(v.boolean()),
   },
-  handler: async (ctx, { id, delivery }) => {
-    await ctx.db.patch(id, { delivery });
+  handler: async (ctx, { id, delivery, summoned }) => {
+    await ctx.db.patch(id, { delivery, summoned });
   },
 });
 

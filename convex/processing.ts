@@ -49,8 +49,10 @@ import {
   firstName,
   gateMode,
   interpretRouterAnswers,
+  isFilterQuestion,
   isLongVoice,
   isShortTranscript,
+  MUSIC_PROBABILITY_THRESHOLD,
   NOISE_PROBABILITY_THRESHOLD,
   resolveAuto,
   type RoutedVoice,
@@ -321,12 +323,16 @@ export const processVoiceMessage = internalAction({
         !isBusinessPrivateResult
           ? "onDemand"
           : "instant");
-      if (initialDelivery === "onDemand" && !isBusinessPrivateResult) {
-        await setMessageReaction(record.chatId, record.messageId, {
-          type: chatSettingsEarly.reaction.type,
-          value: chatSettingsEarly.reaction.value,
-        });
-      }
+      // Audio files wait for the router's music check below.
+      const showOnDemandReaction = async () => {
+        if (initialDelivery === "onDemand" && !isBusinessPrivateResult) {
+          await setMessageReaction(record.chatId, record.messageId, {
+            type: chatSettingsEarly.reaction.type,
+            value: chatSettingsEarly.reaction.value,
+          });
+        }
+      };
+      if (record.mediaKind !== "audio") await showOnDemandReaction();
       const linkedChatMessage = await ctx.runQuery(
         internal.chatMessages.findByMessage,
         { chatId: record.chatId, messageId: record.messageId },
@@ -359,6 +365,20 @@ export const processVoiceMessage = internalAction({
         );
         return;
       }
+      // A song shared as an audio file is not a message to anyone. Skipped
+      // only where nobody asked for it: an audio sent to the bot's DM or
+      // tagged with the bot is still summarized.
+      if (resolved.musicProbability >= MUSIC_PROBABILITY_THRESHOLD) {
+        const audience = voiceAudience(record);
+        const row = await ctx.runQuery(internal.voiceMessages.get, { id });
+        if (audience !== "botDm" && audience !== "guest" && !row?.summoned) {
+          await ignoreVoice(
+            `музыка: is_music=${resolved.musicProbability.toFixed(2)}`,
+          );
+          return;
+        }
+      }
+      if (record.mediaKind === "audio") await showOnDemandReaction();
 
       // ---- 3. Generate summary (always uncached on first run) ---------
       await ctx.runMutation(internal.voiceMessages.setStatus, {
@@ -710,6 +730,9 @@ interface ResolvedSettings {
   // Router's probability that the transcript is ASR noise. 0 when the
   // router didn't run (cached resolution, explicit settings + cache).
   noiseProbability: number;
+  // Router's probability that an audio file is a music track (0 for
+  // voices and video notes, which aren't asked).
+  musicProbability: number;
 }
 
 // Legacy JSON-mode router, kept as a fallback for Decisions API outages.
@@ -731,6 +754,7 @@ async function legacyRoute(
     context: routed.context,
     speechAct: "inform",
     noiseProbability: 0,
+    musicProbability: 0,
   };
 }
 
@@ -772,6 +796,7 @@ export async function resolveVoiceSettings(
         routerMs: 0,
         speechAct: cachedAct,
         noiseProbability: 0,
+        musicProbability: 0,
       };
     }
   }
@@ -790,15 +815,16 @@ export async function resolveVoiceSettings(
   }
   const rStart = Date.now();
   let routed: RoutedVoice | null = null;
-  const questions = buildRouterQuestions().filter(
-    (q) => needsRouting || q.name === "is_noise" || q.name === "speech_act",
-  );
+  const questions = buildRouterQuestions({
+    audioFile: voice?.mediaKind === "audio",
+  }).filter((q) => needsRouting || isFilterQuestion(q.name));
   try {
     const result = await decide(
       buildRouterInput({
         transcript,
         durationSec,
         mediaKind: voice?.mediaKind,
+        audioTrack: voice?.audioTrack,
         replyContext: voice?.replyContext,
         audience,
       }),
@@ -842,6 +868,7 @@ export async function resolveVoiceSettings(
     routerMs,
     speechAct,
     noiseProbability: routed?.noiseProbability ?? 0,
+    musicProbability: routed?.musicProbability ?? 0,
   };
 }
 

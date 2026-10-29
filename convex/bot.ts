@@ -10,7 +10,7 @@ import {
   type SummarizeModelKey,
 } from "./models";
 import { transcribeVoice } from "./openai";
-import { detectAsrNoise, stripAsrTail } from "./voicePolicy";
+import { audioTrackLabel, detectAsrNoise, stripAsrTail } from "./voicePolicy";
 import {
   answerSummaryQuestion,
   buildChatLogFor,
@@ -96,7 +96,13 @@ type TgBusinessConnection = {
   is_enabled: boolean;
 };
 type TgVoice = { file_id: string; duration: number };
-type TgAudio = { file_id: string; duration: number };
+type TgAudio = {
+  file_id: string;
+  duration: number;
+  performer?: string;
+  title?: string;
+  file_name?: string;
+};
 type TgVideoNote = { file_id: string; duration: number; length?: number };
 type TgPhotoSize = { file_id: string };
 type TgVideo = { file_id: string };
@@ -511,6 +517,8 @@ interface MediaInfo {
   fileId: string;
   duration: number | undefined;
   kind: "voice" | "audio" | "video_note";
+  // Audio files: Telegram's track tags, for telling songs from talks.
+  audioTrack?: string;
 }
 function extractMedia(message: TgMessage): MediaInfo | null {
   if (message.voice) {
@@ -525,6 +533,7 @@ function extractMedia(message: TgMessage): MediaInfo | null {
       fileId: message.audio.file_id,
       duration: message.audio.duration,
       kind: "audio",
+      audioTrack: audioTrackLabel(message.audio),
     };
   }
   if (message.video_note) {
@@ -1197,6 +1206,11 @@ async function handleVoice(
     } else if (settings.skipLoadingMessage) {
       delivery = "instantSilent";
     }
+    // Audio files are mostly songs, which the pipeline drops after the
+    // router: no placeholder or reaction until there's a summary to post.
+    if (media.kind === "audio" && delivery === "instant" && !opts.forceInstant) {
+      delivery = "instantSilent";
+    }
   }
 
   let ackMessageId: number | undefined;
@@ -1240,7 +1254,7 @@ async function handleVoice(
 
   // Silent-instant: the trigger reaction doubles as the "seen, working on
   // it" indicator — up immediately, cleared when the summary is posted.
-  if (delivery === "instantSilent") {
+  if (delivery === "instantSilent" && media.kind !== "audio") {
     await setMessageReaction(
       message.chat.id,
       message.message_id,
@@ -1263,6 +1277,8 @@ async function handleVoice(
     businessOutgoing: opts.businessOutgoing,
     replyContext,
     forwardedFromName,
+    audioTrack: media.audioTrack,
+    summoned: opts.forceInstant || undefined,
     delivery,
   });
   // Pull the freshly-generated shortId and link it back to the chat-log
@@ -2503,6 +2519,7 @@ async function summonVoiceSummary(
   await ctx.runMutation(internal.voiceMessages.setDelivery, {
     id: voice._id,
     delivery: "instant",
+    summoned: true,
   });
 }
 

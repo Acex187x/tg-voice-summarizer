@@ -24,8 +24,10 @@ import {
   detectAsrNoise,
   firstName,
   interpretRouterAnswers,
+  isFilterQuestion,
   isLongVoice,
   isShortTranscript,
+  MUSIC_PROBABILITY_THRESHOLD,
   NOISE_PROBABILITY_THRESHOLD,
   resolveAuto,
   stripAsrTail,
@@ -44,6 +46,7 @@ interface EvalItem {
   ackMessageId?: number;
   delivery?: string;
   mediaKind?: string | null;
+  audioTrack?: string | null;
   durationSec?: number | null;
   transcript: string;
   segments?: Array<{ start: number; end: number; text: string }> | null;
@@ -76,15 +79,16 @@ async function route(item: EvalItem, transcript: string) {
   const long = isLongVoice(item.durationSec);
   const audience = voiceAudience(item);
   const needsRouting = !short;
-  const questions = buildRouterQuestions().filter(
-    (q) => needsRouting || q.name === "is_noise" || q.name === "speech_act",
-  );
+  const questions = buildRouterQuestions({
+    audioFile: item.mediaKind === "audio",
+  }).filter((q) => needsRouting || isFilterQuestion(q.name));
   const t0 = Date.now();
   const result = await decide(
     buildRouterInput({
       transcript,
       durationSec: item.durationSec,
       mediaKind: item.mediaKind,
+      audioTrack: item.audioTrack,
       replyContext: item.replyContext,
       audience,
     }),
@@ -126,6 +130,14 @@ async function runSummaries(items: EvalItem[], models: SummarizeModelKey[]) {
           id: item.id,
           ignored: `router is_noise=${r.routed.noiseProbability.toFixed(2)}`,
           noiseProbability: r.routed.noiseProbability,
+        };
+      }
+      if (r.routed.musicProbability >= MUSIC_PROBABILITY_THRESHOLD) {
+        console.log(`[${i + 1}/${items.length}] ${item.id} ignored as music`);
+        return {
+          id: item.id,
+          ignored: `router is_music=${r.routed.musicProbability.toFixed(2)}`,
+          musicProbability: r.routed.musicProbability,
         };
       }
       const extras = {
@@ -197,7 +209,12 @@ async function runNoise(items: EvalItem[]) {
     const rule = detectAsrNoise(transcript);
     if (rule) return { id: item.id, rule, noiseProbability: null };
     const r = await route(item, transcript);
-    return { id: item.id, rule: null, noiseProbability: r.routed.noiseProbability };
+    return {
+      id: item.id,
+      rule: null,
+      noiseProbability: r.routed.noiseProbability,
+      musicProbability: r.routed.musicProbability,
+    };
   });
 }
 

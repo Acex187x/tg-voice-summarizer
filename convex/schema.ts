@@ -59,6 +59,12 @@ export default defineSchema({
     replyContext: v.optional(v.string()),
     // Voice forwarded into the bot DM: name of the original speaker.
     forwardedFromName: v.optional(v.string()),
+    // Audio files: Telegram's "performer — title" (or file name). Helps the
+    // router tell a song from a recorded talk.
+    audioTrack: v.optional(v.string()),
+    // Someone tagged the bot on this voice: answer even if the filters
+    // (music) would skip it.
+    summoned: v.optional(v.boolean()),
 
     // Currently displayed summary in the chat message (for author-driven
     // "apply to chat" edits). Resolved, not "auto".
