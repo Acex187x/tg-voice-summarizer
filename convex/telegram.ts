@@ -4,7 +4,7 @@
 // `ctx`. The Api class is stateless and uses native fetch, so it bundles into
 // Convex's v8 runtime without trouble.
 
-import { Api } from "grammy";
+import { Api, GrammyError, HttpError } from "grammy";
 
 let cached: Api | null = null;
 function api(): Api {
@@ -859,8 +859,47 @@ export async function sendLongMessage(
   return first!;
 }
 
+// Telegram's file endpoints have short 5xx bursts (11-01 17:37–17:53: five
+// voices failed on getFile 504 while the next ones went through). Both
+// calls are idempotent, so transient failures are retried for a few
+// minutes before the voice is failed.
+const FILE_RETRY_DELAYS_MS = [3_000, 10_000, 30_000, 60_000, 120_000];
+
+class FileDownloadError extends Error {
+  constructor(readonly status: number, statusText: string) {
+    super(`Failed to download voice file: ${status} ${statusText}`);
+  }
+}
+
+function isTransientFileError(err: unknown): boolean {
+  if (err instanceof GrammyError) {
+    return err.error_code === 429 || err.error_code >= 500;
+  }
+  if (err instanceof FileDownloadError) {
+    return err.status === 429 || err.status >= 500;
+  }
+  // grammY's network failures and fetch's own (TypeError).
+  return err instanceof HttpError || err instanceof TypeError;
+}
+
+async function withFileRetry<T>(call: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await call();
+    } catch (err) {
+      const delay = FILE_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || !isTransientFileError(err)) throw err;
+      console.warn(
+        `Telegram file call failed, retrying in ${delay / 1000}s`,
+        err instanceof Error ? err.message : String(err),
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
 export async function getFilePath(fileId: string): Promise<string> {
-  const file = await api().getFile(fileId);
+  const file = await withFileRetry(() => api().getFile(fileId));
   if (!file.file_path)
     throw new Error("Telegram returned a file without a file_path");
   return file.file_path;
@@ -868,15 +907,13 @@ export async function getFilePath(fileId: string): Promise<string> {
 
 export async function downloadFile(filePath: string): Promise<Blob> {
   const token = process.env.TELEGRAM_BOT_TOKEN!;
-  const res = await fetch(
-    `https://api.telegram.org/file/bot${token}/${filePath}`,
-  );
-  if (!res.ok) {
-    throw new Error(
-      `Failed to download voice file: ${res.status} ${res.statusText}`,
+  return await withFileRetry(async () => {
+    const res = await fetch(
+      `https://api.telegram.org/file/bot${token}/${filePath}`,
     );
-  }
-  return await res.blob();
+    if (!res.ok) throw new FileDownloadError(res.status, res.statusText);
+    return await res.blob();
+  });
 }
 
 // Used by setup.ts for setWebhook / getWebhookInfo. Returns the raw result
