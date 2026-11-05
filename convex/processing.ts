@@ -1000,7 +1000,7 @@ async function generateAndCacheSummary(
   };
   let text: string;
   try {
-    text = onPartial
+    const raw = onPartial
       ? await chatCompleteStream({
           ...completionArgs,
           onDelta: async (_delta, full) => {
@@ -1008,6 +1008,9 @@ async function generateAndCacheSummary(
           },
         })
       : await chatComplete(completionArgs);
+    // Grok sometimes answers a suicidal vent with a one-line crisis-hotline
+    // message instead of a summary; stripped, that's no reply at all.
+    text = stripUnwantedAsides(raw);
     if (!text) throw new Error(`Summary model returned empty response (model=${model})`);
   } catch (err) {
     // One retry on the other summarizer: provider hiccups shouldn't cost
@@ -1017,9 +1020,10 @@ async function generateAndCacheSummary(
       `summary via ${model} failed, retrying with ${fallback}`,
       err instanceof Error ? err.message : String(err),
     );
-    text = await chatComplete({ ...completionArgs, model: fallback });
+    text = stripUnwantedAsides(
+      await chatComplete({ ...completionArgs, model: fallback }),
+    );
   }
-  text = stripUnwantedAsides(text);
   if (!text) throw new Error("Summary model returned empty response");
   await ctx.runMutation(internal.summaries.store, {
     voiceMessageId: voiceId,
