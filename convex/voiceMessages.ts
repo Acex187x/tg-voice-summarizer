@@ -225,6 +225,23 @@ export const markCancelled = internalMutation({
   },
 });
 
+// A bot tag on a failed or cancelled voice: the failure reply promises a
+// retry, so the pipeline runs again from scratch and answers with a fresh
+// public reply (the old placeholder is deleted by the caller).
+export const resetForRetry = internalMutation({
+  args: { id: v.id("voiceMessages") },
+  handler: async (ctx, { id }) => {
+    await ctx.db.patch(id, {
+      status: "pending",
+      error: undefined,
+      cancelled: undefined,
+      ackMessageId: undefined,
+      delivery: "instant",
+      summoned: true,
+    });
+  },
+});
+
 // ---- Business "send to peer" queue ----------------------------------------
 
 // Marks/unmarks the voice as "deliver the summary to the peer as soon as

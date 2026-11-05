@@ -2506,11 +2506,17 @@ async function summonVoiceSummary(
   }
 
   if (voice.status === "error") {
-    await sendMessage(
-      chatId,
-      `Не удалось обработать это голосовое: ${escapeHtml(voice.error ?? "неизвестная ошибка")}`,
-      { replyToMessageId: target.message_id },
-    );
+    // The failure reply says "tag me and I'll try again": drop it and run
+    // the pipeline again.
+    if (voice.ackMessageId !== undefined) {
+      await deleteMessage(chatId, voice.ackMessageId).catch(() => {});
+    }
+    await ctx.runMutation(internal.voiceMessages.resetForRetry, {
+      id: voice._id,
+    });
+    await ctx.scheduler.runAfter(0, internal.processing.processVoiceMessage, {
+      id: voice._id,
+    });
     return;
   }
 
