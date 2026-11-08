@@ -248,6 +248,9 @@ async function buildEmbeddableText(
 export const indexChatMessage = internalAction({
   args: { chatMessageId: v.id("chatMessages") },
   handler: async (ctx, { chatMessageId }): Promise<number> => {
+    // Kill switch for live embedding (Convex env, no deploy needed): the
+    // vector index is the bot's biggest Database I/O line.
+    if (process.env.DISABLE_LIVE_EMBEDDINGS === "1") return 0;
     return await indexChatMessageNow(ctx, chatMessageId);
   },
 });
