@@ -348,9 +348,9 @@ export default defineSchema({
     contentHash: v.string(),
     embeddedAt: v.number(),
   })
+    // Convex bills index storage per index; on 2026-11-09 this table's indexes
+    // took 15.5 GB vs 3.9 GB of rows. Keep only the index the code reads.
     .index("by_chat_message_chunk", ["chatId", "messageId", "chunkIndex"])
-    .index("by_chat_chunk_index", ["chatId", "chunkIndex"])
-    .index("by_chat_embedded_at", ["chatId", "embeddedAt"])
     .vectorIndex("by_embedding", {
       vectorField: "embedding",
       dimensions: 1536,
