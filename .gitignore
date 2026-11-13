@@ -139,3 +139,7 @@ convex/_generated
 
 # Voice eval bundle (npm run eval:voice)
 scripts/eval/.build/
+
+# History dashboard: secrets and caches stay out of git
+dashboard/connection.json
+__pycache__/
