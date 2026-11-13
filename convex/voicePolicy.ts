@@ -82,6 +82,24 @@ function isHallucinationSentence(s: string): boolean {
   return HALLUCINATION_PATTERNS.some((re) => re.test(s));
 }
 
+// gpt-transcribe sometimes returns "" on real but quiet or messy speech
+// (a 29 s "что это за реклама?!" video note, an apology to a cat). Then we
+// ask whisper-1 once. Whisper invents text on silence ("Thank you for
+// watching", Korean channel outros, counting "1-2-3"), so its answer only
+// counts when it is mostly Cyrillic — the chats' languages; credits like
+// «Субтитры сделал…» are still caught by detectAsrNoise / is_noise later.
+// Checked on 58 empty ≥9 s voices (11-01..11-13): 6/6 real phrases kept,
+// 0/44 hallucinations passed the noise filter.
+export const EMPTY_TRANSCRIPT_RETRY_MIN_SEC = 9;
+const CYRILLIC_SHARE_MIN = 0.6;
+
+export function acceptEmptyTranscriptFallback(text: string): boolean {
+  const letters = text.match(/\p{L}/gu) ?? [];
+  if (letters.length < 3) return false;
+  const cyrillic = letters.filter((ch) => /\p{Script=Cyrillic}/u.test(ch));
+  return cyrillic.length / letters.length >= CYRILLIC_SHARE_MIN;
+}
+
 // Returns a short reason when the transcript is certainly ASR noise, or
 // null when it might be a real message (the model filter decides then).
 export function detectAsrNoise(transcript: string): string | null {

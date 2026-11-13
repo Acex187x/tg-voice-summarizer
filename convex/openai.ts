@@ -9,6 +9,10 @@ import {
   TRANSCRIBE_TIMESTAMPS_MODEL,
 } from "./models";
 import { LONG_VOICE_SECTIONS_MIN_SEC } from "./prompts";
+import {
+  EMPTY_TRANSCRIPT_RETRY_MIN_SEC,
+  acceptEmptyTranscriptFallback,
+} from "./voicePolicy";
 
 const OPENAI_BASE = "https://api.openai.com/v1";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
@@ -196,8 +200,9 @@ export async function transcribeVoice(
       { timeoutMs: 420_000 },
     );
   }
+  let result: TranscriptionResult;
   try {
-    return await transcribeAudioWithTimestamps(
+    result = await transcribeAudioWithTimestamps(
       audio,
       TRANSCRIBE_MODEL,
       filename,
@@ -214,6 +219,25 @@ export async function transcribeVoice(
       filename,
     );
   }
+  if (
+    result.text.trim().length === 0 &&
+    (durationSec ?? 0) >= EMPTY_TRANSCRIPT_RETRY_MIN_SEC
+  ) {
+    try {
+      const retry = await transcribeAudioWithTimestamps(
+        audio,
+        TRANSCRIBE_TIMESTAMPS_MODEL,
+        filename,
+      );
+      if (acceptEmptyTranscriptFallback(retry.text)) return retry;
+    } catch (err) {
+      console.warn(
+        `${TRANSCRIBE_TIMESTAMPS_MODEL} retry on empty transcript failed`,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  return result;
 }
 
 // ---- Chat completion (OpenAI or OpenRouter) -------------------------------
