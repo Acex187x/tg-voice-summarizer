@@ -1,0 +1,15 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Архив · Telegram</title><link rel="stylesheet" href="/style.css"></head><body>
+<aside><div class="brand"><span class="logo">↗</span><div>Архив<span>TELEGRAM WORKSPACE</span></div></div><div class="private">● Приватный просмотр</div>
+<nav><button id="all" class="nav active">◫ <span>Последние сообщения</span></button><button id="voices" class="nav">◉ <span>Голосовые</span></button><button id="summaries" class="nav">▤ <span>Сводки чатов</span></button></nav>
+<div class="section-label">ВАШИ ЧАТЫ <span id="chatCount"></span></div><input id="chatSearch" aria-label="Найти чат" placeholder="Найти чат…"><div id="chats"></div>
+<div class="aside-footer">Только чтение<span>Данные читаются из Convex по запросу</span></div></aside>
+<main><header><span>Рабочее пространство <span class="slash">/</span> История</span><span class="tag">Без фоновой синхронизации</span></header>
+<section class="heading"><div><div class="eyebrow">ПО ЗАПРОСУ</div><h1 id="title">Последние сообщения</h1><p id="subtitle">Последние сохранённые сообщения во всех чатах.</p></div><button id="refresh" class="button">↻ Обновить</button></section>
+<section class="stats"><div><span>Чаты</span><strong id="statChats">—</strong><small>с сохранёнными сообщениями</small></div><div><span>Сообщения</span><strong id="statMessages">—</strong><small>по счётчикам чатов</small></div><div><span>Прочитано из Convex</span><strong class="sync-time" id="statRead">0 Б</strong><small id="statCalls">за эту вкладку</small></div><div><span>Загружено</span><strong class="sync-time" id="statLoaded">—</strong><small>обновление только по кнопке</small></div></section>
+<div id="notice" role="status" hidden></div>
+<section class="workspace"><form class="toolbar" id="searchForm"><div class="search-wrap"><span>⌕</span><input id="search" type="search" placeholder="Поиск по тексту сообщений, Enter…" aria-label="Поиск по тексту"></div><select id="order" aria-label="Порядок"><option value="desc">Сначала новые</option><option value="asc">Сначала старые</option></select></form>
+<div class="filters" id="filters"><label>С <input type="date" id="from" aria-label="С даты"></label><label>По <input type="date" id="to" aria-label="По дату"></label><button id="reset" type="button" class="text-button">Сбросить</button><span class="hint" id="filterHint">Даты и порядок работают внутри выбранного чата.</span></div>
+<div class="results-bar"><span id="resultCount" role="status">—</span><span id="scope">Все чаты</span></div><div id="results"></div>
+<footer class="pagination"><span id="pageInfo"></span><button id="more" class="button" hidden>Загрузить ещё</button></footer></section>
+<p class="footnote">Каждая кнопка — один небольшой запрос к Convex по индексу. Страница ничего не загружает сама по таймеру. Время — в часовом поясе браузера.</p></main>
+<dialog id="detail"><div class="dialog-head"><h2>Детали записи</h2><button id="close" aria-label="Закрыть">×</button></div><div id="detailBody"></div></dialog><script src="/app.js"></script></body></html>

@@ -1,0 +1,27 @@
+# Template. Not installed or enabled automatically; see README.md.
+[Unit]
+Description=Private Telegram history dashboard (read only, on-demand Convex reads)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/served/tg-history-dashboard
+ExecStart=/usr/bin/python3 /root/served/tg-history-dashboard/server.py
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+CPUQuota=50%
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
