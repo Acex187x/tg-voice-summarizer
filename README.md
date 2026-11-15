@@ -1,6 +1,6 @@
 # tg-voice-summarizer
 
-Telegram bot that listens to voice messages and video notes, transcribes them
+A Telegram bot that listens to voice messages and video notes, transcribes them
 (OpenAI `gpt-transcribe`, `whisper-1` for long voices), routes each one with
 the OpenAI Decisions API (GPT-6 Luna) to a summary format, and posts back a
 summary written in the chat's own style.
