@@ -180,6 +180,24 @@ export function audioFilename(
   return mediaKind === "video_note" ? "voice.mp4" : "voice.ogg";
 }
 
+// Hard cap for the whisper-1 retry on an empty transcript. It is optional
+// work, so it must never hold the voice in "transcribing": on 11-14 four
+// voices that took this path stayed stuck there for hours.
+const EMPTY_RETRY_CAP_MS = 90_000;
+
+// Resolves to null when the promise does not settle in time.
+export async function withinMs<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 // Transcribes a Telegram voice/video note/audio. Short voices go to
 // gpt-transcribe (better accuracy, empty text on silence); long ones to
 // whisper-1 for the segment timestamps the sections mode needs. Any
@@ -190,11 +208,16 @@ export async function transcribeVoice(
   mediaKind?: string,
   durationSec?: number | null,
 ): Promise<TranscriptionResult> {
-  const head = new Uint8Array(await audio.slice(0, 12).arrayBuffer());
+  // Each request gets its own Blob built from bytes read once: a second
+  // upload of the downloaded Blob is not guaranteed to work in the Convex
+  // runtime.
+  const bytes = await audio.arrayBuffer();
+  const fresh = () => new Blob([bytes], { type: audio.type });
+  const head = new Uint8Array(bytes.slice(0, 12));
   const filename = audioFilename(filePath, mediaKind, head);
   if ((durationSec ?? 0) >= LONG_VOICE_SECTIONS_MIN_SEC) {
     return await transcribeAudioWithTimestamps(
-      audio,
+      fresh(),
       TRANSCRIBE_TIMESTAMPS_MODEL,
       filename,
       { timeoutMs: 420_000 },
@@ -203,7 +226,7 @@ export async function transcribeVoice(
   let result: TranscriptionResult;
   try {
     result = await transcribeAudioWithTimestamps(
-      audio,
+      fresh(),
       TRANSCRIBE_MODEL,
       filename,
       { prompt: TRANSCRIBE_PROMPT, timeoutMs: 150_000 },
@@ -214,7 +237,7 @@ export async function transcribeVoice(
       err instanceof Error ? err.message : String(err),
     );
     return await transcribeAudioWithTimestamps(
-      audio,
+      fresh(),
       TRANSCRIBE_TIMESTAMPS_MODEL,
       filename,
     );
@@ -224,12 +247,22 @@ export async function transcribeVoice(
     (durationSec ?? 0) >= EMPTY_TRANSCRIPT_RETRY_MIN_SEC
   ) {
     try {
-      const retry = await transcribeAudioWithTimestamps(
-        audio,
-        TRANSCRIBE_TIMESTAMPS_MODEL,
-        filename,
+      const retry = await withinMs(
+        transcribeAudioWithTimestamps(
+          fresh(),
+          TRANSCRIBE_TIMESTAMPS_MODEL,
+          filename,
+          { timeoutMs: EMPTY_RETRY_CAP_MS - 5_000 },
+        ),
+        EMPTY_RETRY_CAP_MS,
       );
-      if (acceptEmptyTranscriptFallback(retry.text)) return retry;
+      if (retry === null) {
+        console.warn(
+          `${TRANSCRIBE_TIMESTAMPS_MODEL} retry on empty transcript timed out`,
+        );
+      } else if (acceptEmptyTranscriptFallback(retry.text)) {
+        return retry;
+      }
     } catch (err) {
       console.warn(
         `${TRANSCRIBE_TIMESTAMPS_MODEL} retry on empty transcript failed`,
