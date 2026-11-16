@@ -62,9 +62,22 @@ function table(name, limit = 8000) {
 }
 
 const since = Date.now() - hours * 3600 * 1000;
-const voices = table("voiceMessages", 4000).filter((v) => v._creationTime >= since);
+// Newest-first pages sized for a day or two of traffic (~50-150 voices/day).
+// Reading 4000 rows of `summaries` hit Convex's "too many system
+// operations" limit on 2026-11-16. A page that ends inside the window
+// would silently drop rows, so that is an error, not a warning.
+function recentRows(name, limit) {
+  const rows = table(name, limit);
+  const oldest = rows.at(-1)?._creationTime;
+  if (rows.length === limit && oldest !== undefined && oldest >= since) {
+    throw new Error(`${name}: ${limit} newest rows do not cover --hours ${hours}; raise the limit`);
+  }
+  return rows.filter((r) => r._creationTime >= since);
+}
+const voices = recentRows("voiceMessages", 1000);
 const voiceIds = new Set(voices.map((v) => v._id));
-const summaries = table("summaries", 4000).filter((s) => voiceIds.has(s.voiceMessageId));
+// Summaries are created after their voice, so the window covers them too.
+const summaries = recentRows("summaries", 1500).filter((s) => voiceIds.has(s.voiceMessageId));
 const memory = new Map(table("chatMemory", 500).map((m) => [m.chatId, m.notes]));
 const nicknames = new Map(
   table("chatNicknames", 2000).map((n) => [`${n.chatId}:${n.userId}`, n.nickname]),
@@ -89,6 +102,7 @@ const items = voices.map((v) => {
     chatId: v.chatId,
     chatTitle: v.chatTitle,
     fromName: v.forwardedFromName ?? v.fromName,
+    forwarded: v.forwardedFromName !== undefined,
     nickname: v.fromId !== undefined ? (nicknames.get(`${v.chatId}:${v.fromId}`) ?? null) : null,
     businessConnectionId: v.businessConnectionId,
     businessOutgoing: v.businessOutgoing,

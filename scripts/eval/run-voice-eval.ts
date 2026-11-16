@@ -53,6 +53,9 @@ interface EvalItem {
   chatStyleNotes?: string | null;
   replyContext?: string | null;
   detail?: number;
+  // True when the voice was forwarded into the bot DM (fromName is then
+  // the original sender, as in prod).
+  forwarded?: boolean;
 }
 
 async function pool<T, R>(
@@ -147,7 +150,7 @@ async function runSummaries(items: EvalItem[], models: SummarizeModelKey[]) {
         peerName: firstName(item.peerName),
         replyContext: item.replyContext ?? null,
         speechAct: r.routed.speechAct,
-        forwarded: false,
+        forwarded: item.forwarded ?? false,
       };
       const req = buildVoiceSummaryRequest(
         {
