@@ -111,6 +111,7 @@ const items = voices.map((v) => {
     delivery: v.delivery,
     mediaKind: v.mediaKind,
     durationSec: v.durationSec,
+    timings: v.timings ?? null,
     transcript: v.transcript ?? "",
     segments: v.transcriptSegments ?? null,
     chatStyleNotes: memory.get(v.chatId) ?? null,

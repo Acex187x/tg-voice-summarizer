@@ -3,6 +3,7 @@
 // transcripts, against real APIs, and writes the outputs for judging.
 //
 //   npm run eval:voice -- summaries <dataset.json> <out.json> [gemini,grok]
+//   (a model may also be a raw OpenRouter id, e.g. google/gemini-4-hydrogen)
 //   npm run eval:voice -- noise <noise.json> <out.json>
 //
 // Needs OPENAI_API_KEY (Decisions API) and OPENROUTER_API_KEY in env.
@@ -117,7 +118,7 @@ async function route(item: EvalItem, transcript: string) {
   };
 }
 
-async function runSummaries(items: EvalItem[], models: SummarizeModelKey[]) {
+async function runSummaries(items: EvalItem[], models: string[]) {
   return await pool(items, 6, async (item, i) => {
     const transcript = stripAsrTail(item.transcript);
     const noise = detectAsrNoise(transcript);
@@ -167,7 +168,11 @@ async function runSummaries(items: EvalItem[], models: SummarizeModelKey[]) {
       );
       const outputs: Record<string, { text: string; ms: number; model: string }> = {};
       for (const key of models) {
-        const model = SUMMARIZE_MODEL_OPTIONS[key].id;
+        // A raw OpenRouter id ("google/gemini-4-hydrogen") tries a model
+        // that is not in the /modal catalog yet; keys map to the catalog.
+        const model = key.includes("/")
+          ? key
+          : SUMMARIZE_MODEL_OPTIONS[key as SummarizeModelKey].id;
         const t0 = Date.now();
         let text = "";
         for (let attempt = 0; attempt < 2 && !text; attempt++) {
@@ -229,7 +234,7 @@ async function main() {
       ? await runNoise(items)
       : await runSummaries(
           items,
-          (modelArg?.split(",") ?? ["gemini", "grok"]) as SummarizeModelKey[],
+          modelArg?.split(",") ?? ["gemini", "grok"],
         );
   writeFileSync(output, JSON.stringify(result, null, 1));
   console.log(`wrote ${output}`);
