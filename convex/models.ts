@@ -61,10 +61,12 @@ export function summarizeModelId(key: SummarizeModelKey): string {
   return SUMMARIZE_MODEL_OPTIONS[key].id;
 }
 
-// Long voices (sections mode) always go to Grok: the eval scored it 4.2 vs
-// 3.3 on per-topic fidelity, and a 10-minute voice can afford the extra
-// latency (Grok's median is ~2.5x slower than Gemini's).
-export const SECTIONS_MODEL_KEY: SummarizeModelKey = "grok";
+// Long voices (sections mode) always use this model, whatever the chat
+// picked in /modal. Blind A/B on 20 voices of 5-44 min (2026-11-24):
+// GPT-6.1 Terra 3.90 vs Grok 4.7 3.85 (Luna 3.40), none rated <=2, while
+// the median answer took 15 s instead of Grok's 235 s. Not in the /modal
+// catalog on purpose: it is not tuned for short voices.
+export const SECTIONS_MODEL = "openai/gpt-6.1-terra";
 
 // Default model id — used when a chat has no explicit pick and by legacy
 // call sites that don't thread a per-chat model through.

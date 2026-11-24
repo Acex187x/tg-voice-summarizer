@@ -13,7 +13,7 @@ import {
   CLASSIFY_PROVIDER,
   DECISIONS_MODEL,
   SUMMARIZE_MODEL,
-  SECTIONS_MODEL_KEY,
+  SECTIONS_MODEL,
   SUMMARIZE_MODEL_OPTIONS,
   SUMMARIZE_PROVIDER,
   summarizeModelId,
@@ -988,7 +988,7 @@ async function generateAndCacheSummary(
   const extras = await loadSummaryExtras(ctx, voice);
   const model =
     args.mode === "sections"
-      ? summarizeModelId(SECTIONS_MODEL_KEY)
+      ? SECTIONS_MODEL
       : (args.modelId ?? SUMMARIZE_MODEL);
   const request = buildVoiceSummaryRequest(args, extras);
   const completionArgs = {
